@@ -1,0 +1,34 @@
+[package]
+name = "acoustic_modem"
+version = "0.1.0"
+edition = "2021"
+description = "Acoustic near-ultrasonic modem: M-FSK + Hamming(7,4) + chirp sync, half-duplex with stop-and-wait ARQ"
+
+[lib]
+name = "acoustic_modem"
+path = "src/lib.rs"
+
+[[bin]]
+name = "modem"
+path = "src/bin/modem.rs"
+
+[dependencies]
+# FFT for the matched filter and the spectral helpers. The detector correlates
+# a 60 ms chirp over every incoming window; time-domain correlation there is
+# O(N*M) and does not keep up with a live stream.
+rustfft = "6"
+# Audio I/O. Kept behind a trait (audio::Backend) so the DSP and the protocol
+# stay testable on machines with no sound card, exactly as the Python does.
+cpal = "0.15"
+
+[dev-dependencies]
+
+[profile.release]
+opt-level = 3
+lto = true
+
+# The demodulator correlates every symbol window against every tone, so an
+# unoptimized build turns a 9-second test run into a 6-minute one. Keep debug
+# info, but do not make `cargo test` unusable.
+[profile.test]
+opt-level = 2
