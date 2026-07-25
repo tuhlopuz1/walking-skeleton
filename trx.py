@@ -42,11 +42,11 @@ import time
 import numpy as np
 
 from modem_core import (
-    SAMPLE_RATE, PROFILES, BANDS, DEFAULT_PROFILE, GAP_MS, LEAD_GUARD_MS,
-    DETECT_THRESHOLD,
+    SAMPLE_RATE, PROFILES, ALL_PROFILES, BANDS, DEFAULT_PROFILE, DEFAULT_BAND,
+    GAP_MS, LEAD_GUARD_MS, DETECT_THRESHOLD,
     PreambleDetector, encode_packet, decode_header, decode_frame,
-    frame_samples, header_symbols, sync_offsets, profiles_in_band,
-    packet_duration_s,
+    frame_samples, header_symbols, sync_offsets, packet_duration_s,
+    band_revision, set_band_base_freq, band_plan, tone_freqs,
 )
 
 try:
@@ -91,6 +91,7 @@ class Transceiver:
         self.device_in = device_in
         self.device_out = device_out
         self.active_profile = DEFAULT_PROFILE
+        self.active_band = DEFAULT_BAND      # which band we TRANSMIT in
         self.detect_threshold = DETECT_THRESHOLD
 
         self._rx_thread: threading.Thread | None = None
@@ -109,41 +110,74 @@ class Transceiver:
             raise RuntimeError(f"sounddevice not available: {AUDIO_ERROR}")
         sd.play(audio, SAMPLE_RATE, device=self.device_out, blocking=True)
 
-    def _send_payload(self, kind: int, data: bytes, profile_id: int, meta: bytes = b""):
+    def _send_payload(self, kind: int, data: bytes, profile_id: int,
+                      band_name: str, meta: bytes = b""):
         if profile_id not in PROFILES:
             raise ValueError(f"unknown profile id {profile_id}")
+        if band_name not in BANDS:
+            raise ValueError(f"unknown band {band_name!r}")
         with self._lock:
             self._msg_id = (self._msg_id + 1) & 0xFFFF
             mid = self._msg_id
         blob = meta + data
         frags = [blob[i:i + FRAG_PAYLOAD] for i in range(0, len(blob), FRAG_PAYLOAD)] or [b""]
         total = len(frags)
-        est = sum(packet_duration_s(len(f) + FRAG_HDR.size, profile_id) for f in frags)
-        self.on_event("info", f"TX {total} frag(s) on {PROFILES[profile_id].name}, "
+        est = sum(packet_duration_s(len(f) + FRAG_HDR.size, profile_id, band_name)
+                  for f in frags)
+        band = BANDS[band_name]
+        self.on_event("info", f"TX {total} frag(s) {PROFILES[profile_id].name} @ "
+                              f"{band.base_freq/1000:.2f} kHz ({band_name}), "
                               f"~{est:.1f}s of audio")
         # Half-duplex: silence our own receiver so it does not decode the speaker.
         self._tx_active.set()
         try:
             for idx, frag in enumerate(frags):
                 head = FRAG_HDR.pack(kind, mid, idx, total)
-                self._play(encode_packet(head + frag, profile_id))
+                self._play(encode_packet(head + frag, profile_id, band_name))
                 self.on_progress(int((idx + 1) / total * 100), f"TX {idx+1}/{total}")
                 time.sleep(0.15)          # inter-frame gap; lets RX re-arm
         finally:
             time.sleep(0.2)               # let the room's echo of our own TX decay
             self._tx_active.clear()
 
-    def send_text(self, text: str, profile_id: int | None = None):
+    def send_text(self, text: str, profile_id: int | None = None,
+                  band_name: str | None = None):
         self._send_payload(T_TEXT, text.encode("utf-8"),
-                           self.active_profile if profile_id is None else profile_id)
+                           self.active_profile if profile_id is None else profile_id,
+                           self.active_band if band_name is None else band_name)
 
-    def send_file(self, path: str, profile_id: int | None = None):
+    def send_file(self, path: str, profile_id: int | None = None,
+                  band_name: str | None = None):
         pid = self.active_profile if profile_id is None else profile_id
+        bnd = self.active_band if band_name is None else band_name
         name = os.path.basename(path).encode("utf-8")[:255]
         with open(path, "rb") as f:
             data = f.read()
         meta = struct.pack(">B", len(name)) + name + struct.pack(">I", len(data))
-        self._send_payload(T_FILE, data, pid, meta=meta)
+        self._send_payload(T_FILE, data, pid, bnd, meta=meta)
+
+    # -------------------------------------------------------------- tuning -- #
+    def set_frequency(self, hz: float, band_name: str | None = None):
+        """Retune a band's lowest tone. Both ends must agree -- it is a channel.
+
+        Takes effect immediately: a running receiver notices the revision bump
+        and rebuilds its matched filters rather than listening on the old spot.
+        """
+        band = set_band_base_freq(band_name or self.active_band, hz)
+        self.on_event("info", f"{band.name} retuned to {band.base_freq/1000:.3f} kHz "
+                              f"(chirp {band.chirp_f0/1000:.2f}-"
+                              f"{band.chirp_f1/1000:.2f} kHz)"
+                              + ("  [AUDIBLE]" if band.audible else ""))
+        return band
+
+    def set_band(self, band_name: str):
+        if band_name not in BANDS:
+            raise ValueError(f"unknown band {band_name!r}; known: {', '.join(BANDS)}")
+        self.active_band = band_name
+        return BANDS[band_name]
+
+    def plan(self) -> list[str]:
+        return band_plan(self.active_band, self.active_profile)
 
     # ------------------------------------------------------------------ RX -- #
     def start_rx(self):
@@ -184,9 +218,25 @@ class Transceiver:
         biggest = FRAG_PAYLOAD + FRAG_HDR.size
         return max(frame_samples(biggest, p) for p in PROFILES.values())
 
+    def _build_detectors(self) -> dict:
+        """One matched filter per DISTINCT chirp.
+
+        Bands are retunable, so two of them can end up on the same frequency.
+        Keying by the chirp's signature collapses those into one detector
+        instead of double-firing on every packet.
+        """
+        out, seen = {}, {}
+        for name, band in BANDS.items():
+            sig = (band.chirp_f0, band.chirp_f1, band.chirp_ms)
+            if sig in seen:
+                continue
+            seen[sig] = name
+            out[name] = PreambleDetector(band, self.detect_threshold)
+        return out
+
     def _rx_loop(self):
-        detectors = {name: PreambleDetector(band, self.detect_threshold)
-                     for name, band in BANDS.items()}
+        detectors = self._build_detectors()
+        band_rev = band_revision()
         gap = int(SAMPLE_RATE * GAP_MS / 1000)
         lead_guard = int(SAMPLE_RATE * LEAD_GUARD_MS / 1000)
         max_hold = self._max_frame_samples() + 3 * SAMPLE_RATE
@@ -226,6 +276,15 @@ class Transceiver:
                         break
 
                 self._update_level(chunk)
+
+                if band_revision() != band_rev:
+                    band_rev = band_revision()
+                    detectors = self._build_detectors()
+                    origin = search = origin + len(buf) + len(chunk)
+                    buf = np.zeros(0, dtype=np.float32)
+                    state = "SEARCH"
+                    self.on_event("info", "retuned -- matched filters rebuilt")
+                    continue
 
                 if self._tx_active.is_set():
                     # Transmitting: drop everything and re-arm past our own audio.
@@ -284,8 +343,10 @@ class Transceiver:
                         self.on_event("info",
                                       f"preamble {det_band} score={score:.2f} "
                                       f"at t={peak / SAMPLE_RATE:.2f}s")
-                        cands = profiles_in_band(det_band)
-                        if self.active_profile in cands:   # try the likely one first
+                        # Profiles are band-agnostic, so any of them may be in
+                        # use; try our own setting first since it usually matches.
+                        cands = list(ALL_PROFILES)
+                        if self.active_profile in cands:
                             cands.remove(self.active_profile)
                             cands.insert(0, self.active_profile)
                         lock_pid = -1
@@ -302,8 +363,8 @@ class Transceiver:
                             s = data_start + int(o) - origin
                             if s < 0:
                                 continue
-                            r = decode_header(buf, s, pid, max_payload=FRAG_PAYLOAD +
-                                              FRAG_HDR.size)
+                            r = decode_header(buf, s, pid, det_band,
+                                              max_payload=FRAG_PAYLOAD + FRAG_HDR.size)
                             if r.ok and r.profile_id == pid:
                                 found = (pid, int(o), r.length, r.confidence)
                                 break
@@ -321,8 +382,8 @@ class Transceiver:
                         # at any of them without waiting for more audio.
                         need = data_start + max_off + frame_samples(lock_len, p)
                         self.on_event("info",
-                                      f"header ok: {p.name} {lock_len}B "
-                                      f"conf={conf:.0f} "
+                                      f"header ok: {p.name} on {det_band} "
+                                      f"{lock_len}B conf={conf:.0f} "
                                       f"(~{frame_samples(lock_len, p)/SAMPLE_RATE:.1f}s)")
                         state = "BODY"
 
@@ -338,7 +399,7 @@ class Transceiver:
                     # millisecond or two. The audio is already buffered, so on a
                     # CRC failure retry the neighbouring offsets before giving up.
                     res = decode_frame(buf, data_start + lock_off - origin,
-                                       lock_pid, lock_len)
+                                       lock_pid, lock_len, det_band)
                     tries = 1
                     if not res.ok:
                         for o in sync_offsets(PROFILES[lock_pid]):
@@ -348,7 +409,7 @@ class Transceiver:
                             if s2 < 0:
                                 continue
                             tries += 1
-                            alt = decode_frame(buf, s2, lock_pid, lock_len)
+                            alt = decode_frame(buf, s2, lock_pid, lock_len, det_band)
                             if alt.ok:
                                 res = alt
                                 break
@@ -370,7 +431,7 @@ class Transceiver:
     def _update_level(self, chunk: np.ndarray):
         rms = float(np.sqrt(np.mean(chunk.astype(np.float64) ** 2))) if len(chunk) else 0.0
         self.stats["rms_db"] = round(20 * np.log10(rms + 1e-9), 1)
-        band = BANDS[PROFILES[self.active_profile].band]
+        band = BANDS[self.active_band]
         n = min(len(chunk), 8192)
         if n >= 512:
             seg = chunk[-n:].astype(np.float64) * np.hanning(n)
@@ -425,35 +486,54 @@ class Transceiver:
 # --------------------------------------------------------------------------- #
 # Diagnostics -- these answer "is the link dead, or is my hardware dead?"
 # --------------------------------------------------------------------------- #
-def selftest(profile_id: int = DEFAULT_PROFILE) -> list[str]:
-    """Encode -> decode entirely in memory. No sound card involved."""
+def selftest(profile_id: int = DEFAULT_PROFILE,
+             band_name: str | None = None) -> list[str]:
+    """Encode -> decode entirely in memory, at the CURRENT tuning.
+
+    No sound card involved, so this isolates "is my configuration decodable"
+    from "does my hardware carry it".
+    """
     from modem_core import try_decode, data_offset_in_packet
     out = []
     payload = b"selftest " + bytes(range(32))
-    for pid in ([profile_id] if profile_id in PROFILES else PROFILES):
-        pkt = encode_packet(payload, pid)
-        stream = np.concatenate([np.zeros(3000, np.float32), pkt, np.zeros(3000, np.float32)])
-        det = PreambleDetector(BANDS[PROFILES[pid].band])
-        sc = det.scores(stream)
-        peak = int(np.argmax(sc))
-        r = try_decode(stream, [pid], peak + data_offset_in_packet(pid))
-        ok = r.ok and r.payload == payload
-        out.append(f"{PROFILES[pid].name:8s} score={sc[peak]:.2f} "
-                   f"{'PASS' if ok else 'FAIL ' + r.reason}")
+    bands = [band_name] if band_name in BANDS else list(BANDS)
+    for bnd in bands:
+        out.extend(band_plan(bnd))
+        for pid in ([profile_id] if profile_id in PROFILES else PROFILES):
+            pkt = encode_packet(payload, pid, bnd)
+            stream = np.concatenate([np.zeros(3000, np.float32), pkt,
+                                     np.zeros(3000, np.float32)])
+            det = PreambleDetector(BANDS[bnd])
+            sc = det.scores(stream)
+            peak = int(np.argmax(sc))
+            r = try_decode(stream, [pid], peak + data_offset_in_packet(bnd), bnd)
+            ok = r.ok and r.payload == payload
+            out.append(f"  {PROFILES[pid].name:8s} score={sc[peak]:.2f} "
+                       f"{'PASS' if ok else 'FAIL ' + r.reason}")
     return out
 
 
-def probe(device_in=None, device_out=None, seconds: float = 0.3) -> list[str]:
+def probe(device_in=None, device_out=None, seconds: float = 0.3,
+          band_name: str | None = None) -> list[str]:
     """Play tones through the speaker and measure what the mic hears.
 
-    This is the fastest way to find out whether this hardware pair can carry the
-    near-ultrasonic band at all. Many laptop mics roll off above ~18 kHz, and
-    Windows mic "enhancements" (noise suppression / AEC) delete it outright.
+    This is the fastest way to find out whether this hardware pair can carry a
+    given band. Many laptop mics roll off above ~18 kHz, and Windows mic
+    "enhancements" (noise suppression / AEC) delete it outright. The sweep
+    always includes the frequencies the active band is CURRENTLY tuned to, so
+    it stays meaningful after /freq.
     """
     if not HAVE_AUDIO:
         return [f"sounddevice not available: {AUDIO_ERROR}"]
     freqs = [1000, 3000, 4000, 6000, 10000, 14000, 16000, 17000,
              18200, 18600, 19000, 19600, 20000]
+    bnd = BANDS[band_name] if band_name in BANDS else None
+    tuned: list[int] = []
+    if bnd is not None:
+        tuned = sorted({int(round(f)) for p in PROFILES.values()
+                        for f in tone_freqs(p, bnd)}
+                       | {int(bnd.chirp_f0), int(bnd.chirp_f1)})
+        freqs = sorted(set(freqs) | set(tuned))
     n = int(SAMPLE_RATE * seconds)
     t = np.arange(n) / SAMPLE_RATE
     env = np.ones(n)
@@ -480,20 +560,36 @@ def probe(device_in=None, device_out=None, seconds: float = 0.3) -> list[str]:
     # Bars are relative to the loudest tone measured -- absolute dBFS depends on
     # the volume knob, while the SHAPE of the response is what decides the band.
     top = max(levels.values())
-    out = [f"(bars are relative to the strongest tone, {top:.1f} dB)"]
+    out = [f"(bars are relative to the strongest tone, {top:.1f} dB; "
+           f"'<' marks the tuned band)"]
     for f, db in levels.items():
-        out.append(f"{f:6d} Hz  {db - top:6.1f}  {'#' * max(0, min(46, int(46 + (db - top))))}")
+        mark = " <" if f in tuned else ""
+        out.append(f"{f:6d} Hz  {db - top:6.1f}  "
+                   f"{'#' * max(0, min(44, int(44 + (db - top))))}{mark}")
 
     ref = max(levels.get(f, -99) for f in (1000, 3000, 4000))
-    ultra = max(levels.get(f, -99) for f in (18200, 18600, 19000))
     out.append("")
-    if ultra < ref - 30:
-        out.append(f"VERDICT: near-ultrasonic is {ref - ultra:.0f} dB below the audible "
-                   f"band -- this hardware will not carry profiles 0-2.")
-        out.append("         Use profile 3 (AUDIBLE) on BOTH devices: /profile 3")
+    if bnd is not None and tuned:
+        here = min(levels.get(f, -99) for f in tuned)
+        drop = ref - here
+        out.append(f"VERDICT for {bnd.name} @ {bnd.base_freq/1000:.2f} kHz: weakest "
+                   f"tone is {drop:.0f} dB below the audible reference.")
+        if drop > 30:
+            out.append("         Too weak -- this hardware will not carry that "
+                       "tuning.")
+            out.append("         Try '/mode audible', or '/freq <kHz>' somewhere "
+                       "stronger in the list above.")
+        else:
+            out.append("         That should work.")
     else:
-        out.append(f"VERDICT: 18-19 kHz is {ref - ultra:.0f} dB down -- "
-                   f"profiles 0-2 should work.")
+        ultra = max(levels.get(f, -99) for f in (18200, 18600, 19000))
+        if ultra < ref - 30:
+            out.append(f"VERDICT: near-ultrasonic is {ref - ultra:.0f} dB below the "
+                       f"audible band -- this hardware will not carry it.")
+            out.append("         Use '/mode audible' on BOTH devices.")
+        else:
+            out.append(f"VERDICT: 18-19 kHz is {ref - ultra:.0f} dB down -- "
+                       f"the inaudible band should work.")
     out.append("NOTE: Windows quietens playback while a mic is open ('communications"
                " activity'),")
     out.append("      measured at ~7 dB here. Since both devices keep RX on, that hits"
@@ -504,36 +600,40 @@ def probe(device_in=None, device_out=None, seconds: float = 0.3) -> list[str]:
 
 
 def loopback(profile_id: int = DEFAULT_PROFILE, text: str = "loopback test",
-             device_in=None, device_out=None) -> list[str]:
+             device_in=None, device_out=None,
+             band_name: str = DEFAULT_BAND) -> list[str]:
     """Full round trip on one machine: speaker -> air -> mic -> decoder."""
     if not HAVE_AUDIO:
         return [f"sounddevice not available: {AUDIO_ERROR}"]
     from modem_core import try_decode, data_offset_in_packet
     payload = FRAG_HDR.pack(T_TEXT, 1, 0, 1) + text.encode()
-    pkt = encode_packet(payload, profile_id)
+    pkt = encode_packet(payload, profile_id, band_name)
     pad = np.zeros(int(SAMPLE_RATE * 0.4), np.float32)
     sig = np.concatenate([pad, pkt, pad])
     rec = sd.playrec(sig, SAMPLE_RATE, channels=1, blocking=True,
                      device=(device_in, device_out))[:, 0]
-    band = BANDS[PROFILES[profile_id].band]
+    band = BANDS[band_name]
     det = PreambleDetector(band)
     sc = det.scores(rec)
     if not len(sc):
         return ["loopback: recording too short"]
     peak = int(np.argmax(sc))
-    out = [f"recorded rms={20*np.log10(np.sqrt(np.mean(rec**2))+1e-9):.1f} dBFS",
+    out = [f"{PROFILES[profile_id].name} on {band_name} @ "
+           f"{band.base_freq/1000:.2f} kHz",
+           f"recorded rms={20*np.log10(np.sqrt(np.mean(rec**2))+1e-9):.1f} dBFS",
            f"best preamble score={sc[peak]:.3f} (need >= {det.threshold}), "
            f"noise median={np.median(sc):.3f}"]
     if sc[peak] < det.threshold:
         out.append("FAIL: preamble not detected -- the mic never heard the chirp.")
-        out.append("      Raise the volume, or run /probe to check the band.")
+        out.append("      Raise the volume, or run /probe to check this tuning.")
         return out
-    r = try_decode(rec, [profile_id], peak + data_offset_in_packet(profile_id))
+    r = try_decode(rec, [profile_id], peak + data_offset_in_packet(band_name),
+                   band_name)
     if r.ok:
         got = r.payload[FRAG_HDR.size:].decode("utf-8", "replace")
         out.append(f"PASS: decoded {got!r} (conf={r.confidence:.0f})")
     else:
         out.append(f"FAIL at decode: {r.reason}")
         out.append("      Preamble was heard, so timing/SNR is marginal -- "
-                   "try /profile 2 (ROBUST) or move the devices closer.")
+                   "try '/profile 2' (ROBUST), '/mode audible', or move closer.")
     return out

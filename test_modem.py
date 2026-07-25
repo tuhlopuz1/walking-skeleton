@@ -16,10 +16,10 @@ import types
 import numpy as np
 
 from modem_core import (
-    SAMPLE_RATE, PROFILES, BANDS, PreambleDetector, Profile,
+    SAMPLE_RATE, PROFILES, ALL_PROFILES, BANDS, PreambleDetector,
     crc16, hamming_encode, hamming_decode, interleave, deinterleave,
     encode_packet, try_decode, data_offset_in_packet, packet_duration_s,
-    build_frame_bits, MFSKModulator, frame_symbols,
+    build_frame_bits,
 )
 
 FAILURES: list[str] = []
@@ -89,38 +89,97 @@ def test_sync():
 
 
 def test_codec():
-    section("packet encode -> decode over all profiles")
+    section("packet encode -> decode, every profile in every band")
     rng = np.random.default_rng(3)
-    for pid, p in PROFILES.items():
-        good = 0
-        for _ in range(4):
-            payload = bytes(rng.integers(0, 256, 40, dtype=np.uint8))
-            pkt = encode_packet(payload, pid)
-            pre = int(rng.integers(1000, 9000))
-            stream = np.concatenate([
-                (rng.standard_normal(pre) * 0.01).astype(np.float32),
-                (pkt * 0.5 + rng.standard_normal(len(pkt)) * 0.01).astype(np.float32),
-                (rng.standard_normal(20_000) * 0.01).astype(np.float32)])
-            det = PreambleDetector(BANDS[p.band])
-            peak = int(np.argmax(det.scores(stream)))
-            r = try_decode(stream, [pid], peak + data_offset_in_packet(pid))
-            good += bool(r.ok and r.payload == payload)
-        check(good == 4, f"{p.name}: 4/4 payloads recovered "
-                         f"({packet_duration_s(40, pid):.1f}s of audio, "
-                         f"{p.bitrate:.0f} raw bit/s)")
+    for bnd in BANDS:
+        for pid, p in PROFILES.items():
+            good = 0
+            for _ in range(4):
+                payload = bytes(rng.integers(0, 256, 40, dtype=np.uint8))
+                pkt = encode_packet(payload, pid, bnd)
+                pre = int(rng.integers(1000, 9000))
+                stream = np.concatenate([
+                    (rng.standard_normal(pre) * 0.01).astype(np.float32),
+                    (pkt * 0.5 + rng.standard_normal(len(pkt)) * 0.01).astype(np.float32),
+                    (rng.standard_normal(20_000) * 0.01).astype(np.float32)])
+                det = PreambleDetector(BANDS[bnd])
+                peak = int(np.argmax(det.scores(stream)))
+                r = try_decode(stream, [pid], peak + data_offset_in_packet(bnd), bnd)
+                good += bool(r.ok and r.payload == payload)
+            check(good == 4, f"{bnd}/{p.name}: 4/4 payloads recovered "
+                             f"({packet_duration_s(40, pid, bnd):.1f}s of audio, "
+                             f"{p.bitrate:.0f} raw bit/s)")
 
     section("per-frame profile adaptation")
-    for pid, p in PROFILES.items():
-        from modem_core import profiles_in_band
-        pkt = encode_packet(b"auto-detect me", pid)
-        stream = np.concatenate([np.zeros(5000, np.float32), pkt,
-                                 np.zeros(5000, np.float32)])
-        det = PreambleDetector(BANDS[p.band])
+    for bnd in BANDS:
+        for pid, p in PROFILES.items():
+            pkt = encode_packet(b"auto-detect me", pid, bnd)
+            stream = np.concatenate([np.zeros(5000, np.float32), pkt,
+                                     np.zeros(5000, np.float32)])
+            det = PreambleDetector(BANDS[bnd])
+            peak = int(np.argmax(det.scores(stream)))
+            r = try_decode(stream, ALL_PROFILES,
+                           peak + data_offset_in_packet(bnd), bnd)
+            check(r.ok and r.profile_id == pid and r.payload == b"auto-detect me",
+                  f"{bnd}/{p.name} decoded without the receiver being told "
+                  f"the profile")
+
+
+def test_tuning():
+    section("retuning the band (/freq)")
+    from modem_core import (set_band_base_freq, check_band_freq, band_revision,
+                            tone_freqs, MAX_BAND_FREQ)
+    original = BANDS["ULTRA"]
+    try:
+        rev0 = band_revision()
+        b = set_band_base_freq("ULTRA", 19_000)
+        check(b.base_freq == 19_000 and band_revision() > rev0,
+              "set_band_base_freq moves the base and bumps the revision")
+        check(abs(b.chirp_f0 - 18_600) < 1 and abs(b.chirp_f1 - 20_400) < 1,
+              f"chirp follows the base ({b.chirp_f0:.0f}-{b.chirp_f1:.0f} Hz)")
+        check(abs(tone_freqs(PROFILES[0], b)[0] - 19_000) < 1,
+              "tones follow the base too")
+
+        # a packet built at the new tuning must decode at the new tuning
+        pkt = encode_packet(b"tuned", 1, "ULTRA")
+        stream = np.concatenate([np.zeros(4000, np.float32), pkt,
+                                 np.zeros(4000, np.float32)])
+        det = PreambleDetector(BANDS["ULTRA"])
         peak = int(np.argmax(det.scores(stream)))
-        r = try_decode(stream, profiles_in_band(p.band),
-                       peak + data_offset_in_packet(pid))
-        check(r.ok and r.profile_id == pid and r.payload == b"auto-detect me",
-              f"{p.name} decoded without the receiver being told the profile")
+        r = try_decode(stream, ALL_PROFILES, peak + data_offset_in_packet("ULTRA"),
+                       "ULTRA")
+        check(r.ok and r.payload == b"tuned", "packet round-trips at 19.0 kHz")
+
+        # ...and must NOT be readable by a receiver left on the old frequency.
+        # A small retune still overlaps the old chirp sweep, so the preamble may
+        # well still be seen -- what has to fail is the DATA, whose tones moved.
+        old = PreambleDetector(original)
+        peak_old = int(np.argmax(old.scores(stream)))
+        BANDS["ULTRA"] = original          # decode as the stale receiver would
+        r_old = try_decode(stream, ALL_PROFILES,
+                           peak_old + data_offset_in_packet("ULTRA"), "ULTRA")
+        check(not r_old.ok,
+              f"a receiver left on the old frequency cannot read it "
+              f"({r_old.reason}) -- the tuning really is a channel")
+        set_band_base_freq("ULTRA", 19_000)
+
+        # A far retune is not even detected.
+        set_band_base_freq("ULTRA", 8_000)
+        far = encode_packet(b"far away", 1, "ULTRA")
+        far_stream = np.concatenate([np.zeros(4000, np.float32), far,
+                                     np.zeros(4000, np.float32)])
+        check(float(np.max(old.scores(far_stream))) < old.threshold,
+              "a far retune (8 kHz vs 18.2 kHz) is invisible to the old tuning")
+
+        check("too high" in check_band_freq(MAX_BAND_FREQ + 1000),
+              "frequencies above the Nyquist headroom are rejected")
+        check("too low" in check_band_freq(50), "frequencies near DC are rejected")
+        check(check_band_freq(8_000) == "", "a sane midband frequency is accepted")
+
+        set_band_base_freq("ULTRA", 4_000)
+        check(BANDS["ULTRA"].audible, "a band tuned to 4 kHz reports as audible")
+    finally:
+        BANDS["ULTRA"] = original
 
 
 def test_symbol_errors():
@@ -210,9 +269,9 @@ def test_rx_state_machine():
                   f"{label} (det={t.stats['detections']} ok={t.stats['rx_ok']} "
                   f"bad={t.stats['rx_bad']})")
 
-        def frame(text, pid, idx=0, total=1, mid=1, gain=0.5):
+        def frame(text, pid, idx=0, total=1, mid=1, gain=0.5, band="ULTRA"):
             return encode_packet(FRAG_HDR.pack(T_TEXT, mid, idx, total)
-                                 + text.encode(), pid) * gain
+                                 + text.encode(), pid, band) * gain
 
         for pid, p in PROFILES.items():
             run(f"{p.name}: single frame end-to-end",
@@ -229,6 +288,23 @@ def test_rx_state_machine():
         run("multi-fragment message reassembled",
             [frame(f, 0, i, len(parts), mid=5) for i, f in enumerate(parts)],
             0, body)
+
+        # The audible band is a full peer, not a fallback: same profiles, and a
+        # receiver whose own setting says ULTRA still picks an AUDIO packet up.
+        run("audible band, receiver configured for the inaudible one",
+            [frame("audible band works", 1, band="AUDIO")], 1,
+            "audible band works")
+
+        # Retuning a LIVE receiver must rebuild its matched filters.
+        from modem_core import set_band_base_freq, BANDS as _B
+        keep = _B["ULTRA"]
+        try:
+            set_band_base_freq("ULTRA", 16_000)
+            run("retuned to 16 kHz: a live receiver follows the new frequency",
+                [frame("retuned link", 1)], 1, "retuned link")
+        finally:
+            _B["ULTRA"] = keep
+            set_band_base_freq("ULTRA", keep.base_freq)
 
         # silence must not produce phantom messages
         state["stream"] = (np.random.default_rng(6)
@@ -272,6 +348,7 @@ if __name__ == "__main__":
     test_fec()
     test_sync()
     test_codec()
+    test_tuning()
     test_symbol_errors()
     test_rx_state_machine()
     test_rx_thread_reports_errors()

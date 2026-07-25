@@ -25,40 +25,73 @@ python tui.py
 ### First time on a new pair of machines — do this in order
 
 1. `/probe` on **each** machine. It plays a tone sweep and measures what that
-   machine's own mic hears, then tells you whether the 18–19 kHz band survives.
+   machine's own mic hears, then tells you whether the band you are tuned to
+   survives.
 2. `/loopback` on each machine. Full speaker→air→mic round trip; it should
    print `PASS: decoded ...`.
-3. `/rx on` on **both** machines, and set the **same** `/profile` on both.
+3. `/rx on` on **both** machines, with the **same** `/mode` and `/freq`.
 4. Type a message on one. Watch the other machine's meter line.
 
 The meter line is the thing to read when something does not work:
 
 ```
-mic  -34.1dB [########--------]  band  -48.0dB  preamble now=0.31 best=0.55 noise=0.02 (need>=0.15)  search  ok=3 bad=0 det=3
+mic  -34.1dB [########--------]  band  -48.0dB  preamble now=0.31 best=0.55 noise=0.02 (need>=0.20)  search  ok=3 bad=0 det=3 rej=0
 ```
 
 - `mic` near `-90 dB` → the microphone is not capturing at all (wrong input
   device, muted, or no permission). Use `/devices` and `/in <n>`.
 - `mic` fine but `preamble best` stays below the threshold → the sender's tones
-  are not reaching this mic. Raise the volume, move closer, or drop to
-  `/profile 3`.
+  are not reaching this mic. Raise the volume, move closer, or `/mode audible`.
 - `det` counts up but `bad` counts too → sync works, SNR does not. Try
-  `/profile 2` (ROBUST), or `/profile 3` if you are in the ultrasonic band.
+  `/profile 2` (ROBUST), or `/mode audible`.
 
 ## Commands
 
-`/rx on|off` · `/profile 0..3` · `/file <path>` · `/devices` · `/in <n>` ·
-`/out <n>` · `/probe` · `/selftest` · `/loopback` · `/thresh <x>` · `/clear` ·
-`/quit`. Anything else typed is sent as a text message.
+`/mode audible|inaudible` · `/freq <kHz>` · `/profile 0..2` · `/rx on|off` ·
+`/file <path>` · `/devices` · `/in <n>` · `/out <n>` · `/probe` · `/selftest` ·
+`/loopback` · `/thresh <x>` · `/clear` · `/quit`. Anything else typed is sent as
+a text message.
+
+## Frequency: `/mode` and `/freq`
+
+Where the link sits and how it modulates are **independent** settings.
+
+- **`/mode audible` / `/mode inaudible`** switches band. Inaudible is the
+  near-ultrasonic default; audible drops to ~3 kHz and works on any speaker/mic
+  pair on earth, including Bluetooth. (Aliases: `ultrasonic`, `audio`, `ultra`…)
+- **`/freq 18.6`** retunes the *current* band's lowest tone — accepts kHz
+  (`18.6`) or Hz (`18600`), and `/freq reset` restores the default. `/freq` with
+  no argument prints the current tone plan.
+- **`/profile 0|1|2`** picks FAST / NORMAL / ROBUST. Profiles are band-agnostic:
+  the same three work whether you are at 18 kHz or 3 kHz.
+
+The chirp preamble and all data tones move together with `/freq`, so a retune is
+a genuine **channel change** — a receiver left on the old frequency will not
+read you. Both devices must agree. The offsets are rejected up front if the
+tones would run past Nyquist or down into DC.
+
+```
+/mode inaudible
+/freq 18.6            # tones at 18.60 / 18.80 / 19.00 / 19.20 kHz on NORMAL
+/probe                # confirm this machine actually passes 18.6-19.2 kHz
+```
+
+Because retuning is live, a running receiver notices and rebuilds its matched
+filters — no need to stop and restart RX.
+
+Two devices can also just be put on **different** bands to run two independent
+links in the same room; the receiver matched-filters every band at once and
+tells you which one a packet arrived on.
 
 ## Modulation profiles (the adaptivity knob)
 
-| id | name    | band           | scheme | symbol/guard | raw bit/s | net B/s | use                         |
-| -- | ------- | -------------- | ------ | ------------ | --------- | ------- | --------------------------- |
-| 0  | FAST    | 18.20–19.40 k | 4-FSK  | 15/5 ms      | 100       | ~7.1    | low noise, close range      |
-| 1  | NORMAL  | 18.20–18.80 k | 4-FSK  | 25/8 ms      | 61        | ~4.3    | default                     |
-| 2  | ROBUST  | 18.20–19.10 k | 4-FSK  | 45/15 ms     | 33        | ~2.4    | noisy / >2 m                |
-| 3  | AUDIBLE | 3.00–4.75 k   | 8-FSK  | 20/6 ms      | 115       | ~8.2    | hardware that can't do 18 k |
+Tone spacing is relative to the band's base frequency, set by `/freq`.
+
+| id | name   | tones            | scheme | symbol/guard | raw bit/s | net B/s | use                    |
+| -- | ------ | ---------------- | ------ | ------------ | --------- | ------- | ---------------------- |
+| 0  | FAST   | base … base+1200 | 4-FSK  | 15/5 ms      | 100       | ~7.1    | low noise, close range |
+| 1  | NORMAL | base … base+600  | 4-FSK  | 25/8 ms      | 61        | ~4.3    | default                |
+| 2  | ROBUST | base … base+900  | 4-FSK  | 45/15 ms     | 33        | ~2.4    | noisy / >2 m           |
 
 FAST is 4-FSK rather than 8-FSK deliberately. Eight tones only fit the usable
 18.0–19.5 kHz window at ~170 Hz spacing, and measured over the air that spacing
@@ -73,15 +106,20 @@ M-FSK with guard intervals, not a bug.
 The profile id travels in the frame header, so the receiver adapts per-frame: it
 will decode any profile in the band it detected, regardless of its own setting.
 The `/profile` setting only picks what **you transmit** with (and which profile
-is tried first on receive).
+is tried first on receive). `/mode` and `/freq` are different — those really do
+have to match on both ends.
 
-## Why the ultrasonic band is 18.2–19.6 kHz and not 18.5–21 kHz
+## Why the inaudible band defaults to 18.2 kHz and not 18.5–21 kHz
 
 Measured on real consumer hardware, the speaker→mic response falls off a cliff
 above ~19.5 kHz (about 15 dB down at 20 kHz relative to 18.6 kHz). Tones and
-chirps placed up there simply do not come back. Everything — data tones and the
-preamble chirp — is kept below that knee. It is still inaudible to essentially
-everyone.
+chirps placed up there simply do not come back. The default keeps everything —
+data tones and the preamble chirp — below that knee, while staying inaudible to
+essentially everyone.
+
+`/freq` lets you move it anyway: run `/probe` first and pick a spot where your
+own hardware is strong. The permitted range is roughly 0.7–20.2 kHz (the guard
+rails keep the chirp above 300 Hz and the top tone under 21.6 kHz).
 
 ## Troubleshooting: receiver sees nothing
 
@@ -98,16 +136,20 @@ Work down this list; the first two are by far the most common on Windows.
    and will delete a steady near-ultrasonic tone outright.
 3. **Wrong device.** `/devices` then `/in <n>` / `/out <n>`. Bluetooth headsets
    are the classic trap: in hands-free mode they run at 8–16 kHz and cannot
-   carry the ultrasonic band at all — use `/profile 3` or wired/built-in audio.
+   carry the inaudible band at all — use `/mode audible` or wired/built-in audio.
 4. **Mic sample rate.** The mic must accept 48 kHz. `/rx on` reports the error if
    it cannot. Set the device to "48000 Hz" in the Windows device properties.
-5. **Volume.** The sender needs to be reasonably loud; ultrasonic content is
-   often attenuated by the speaker itself. `/probe` quantifies this.
-6. Still nothing? `/thresh 0.12` lowers the detection bar (at the cost of more
-   false triggers), and `/profile 3` moves the whole link into the audible band,
-   which any hardware can carry.
+5. **Volume, and check the speaker is not muted.** The sender needs to be
+   reasonably loud; ultrasonic content is attenuated by the speaker itself.
+   `/probe` quantifies this — if every bar is deep in the negative, the output is
+   muted or turned down, not broken.
+6. **Mismatched tuning.** `/mode` and `/freq` must be identical on both ends.
+   Run `/freq` on each and compare, or `/freq reset` on both.
+7. Still nothing? `/thresh 0.12` lowers the detection bar (at the cost of more
+   false triggers), and `/mode audible` moves the whole link into the audible
+   band, which any hardware can carry.
 
-Note: `/loopback` on the **audible** profile can under-perform on a laptop that
+Note: `/loopback` in the **audible** band can under-perform on a laptop that
 plays and records at once — Windows' acoustic echo canceller actively subtracts
 the speaker signal from the mic. That is a same-machine artifact; it does not
 happen between two separate devices.
@@ -121,12 +163,22 @@ def got(kind, data, meta):
     print(kind, meta, data[:40])
 
 trx = Transceiver(on_message=got, on_event=lambda lvl, txt: print(lvl, txt))
+
+trx.set_band("AUDIO")          # or "ULTRA" (default)
+trx.set_frequency(3_500)       # Hz; moves tones AND the chirp, live
+print("\n".join(trx.plan()))   # where the tones actually are right now
+
 trx.start_rx()
 trx.send_text("hello", profile_id=1)
 ```
 
 `on_event` is the diagnostic channel — preamble detections, header/CRC failures,
 and RX-thread errors all surface there rather than being swallowed.
+
+Below that, `modem_core` is pure DSP with no audio dependency:
+`BANDS` / `PROFILES`, `set_band_base_freq(band, hz)`, `check_band_freq(hz)`,
+`band_plan(band)`, `tone_freqs(profile, band)`, `encode_packet(payload,
+profile_id, band)` and `try_decode(audio, profile_ids, data_start, band)`.
 
 ## How the receiver works
 

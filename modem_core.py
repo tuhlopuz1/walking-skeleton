@@ -18,7 +18,8 @@ even on machines without a sound device -- good for unit tests / reuse as a modu
 
 from __future__ import annotations
 import numpy as np
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from functools import lru_cache
 
 SAMPLE_RATE = 48_000            # Hz, per Nyquist requirement in spec
 
@@ -139,20 +140,43 @@ def deinterleave(bits: np.ndarray) -> np.ndarray:
 
 
 # --------------------------------------------------------------------------- #
-# Bands. A band = the slice of spectrum a link lives in, plus the chirp preamble
-# used to find and time-align packets inside it. The receiver runs one matched
-# filter per band, so ULTRA and AUDIO links can coexist and auto-detect.
+# Bands -- WHERE in the spectrum a link lives. A band is the tunable part of the
+# design: it fixes the lowest data tone and the chirp preamble that finds and
+# time-aligns packets. Profiles (below) say HOW to modulate and are band-
+# agnostic, so "switch to the audible band" and "change speed" are independent
+# knobs, and either band can be retuned to any centre frequency.
+#
+# The receiver runs one matched filter per band, so an audible and an inaudible
+# link coexist and auto-detect.
 # --------------------------------------------------------------------------- #
+AUDIBLE_LIMIT = 17_000.0        # below this, most listeners can hear the tones
+MIN_BAND_FREQ = 300.0           # keep the chirp clear of DC / room rumble
+MAX_BAND_FREQ = 0.45 * SAMPLE_RATE   # 21.6 kHz -- leave headroom under Nyquist
+
+
 @dataclass(frozen=True)
 class Band:
     name: str
-    chirp_f0: float
-    chirp_f1: float
+    base_freq: float          # lowest data tone
+    lead: float               # Hz below base_freq where the chirp starts
+    span: float               # Hz above base_freq where the chirp ends
     chirp_ms: float
+
+    @property
+    def chirp_f0(self) -> float:
+        return self.base_freq - self.lead
+
+    @property
+    def chirp_f1(self) -> float:
+        return self.base_freq + self.span
 
     @property
     def chirp_samples(self) -> int:
         return int(SAMPLE_RATE * self.chirp_ms / 1000)
+
+    @property
+    def audible(self) -> bool:
+        return self.base_freq < AUDIBLE_LIMIT
 
 
 BANDS = {
@@ -160,11 +184,68 @@ BANDS = {
     # off a cliff above ~19.5 kHz. The chirp deliberately stops below that: a
     # sweep whose top half the hardware cannot reproduce only correlates on the
     # part that survives, which throws away detection margin.
-    "ULTRA": Band("ULTRA", 17_800, 19_600, 60.0),
+    "ULTRA": Band("ULTRA", 18_200, 400, 1400, 60.0),
     # Audible fallback: survives literally any speaker/mic pair, incl. Bluetooth.
     # Use this when ULTRA does not get through -- see /probe in the TUI.
-    "AUDIO": Band("AUDIO", 2_800, 5_400, 60.0),
+    "AUDIO": Band("AUDIO", 3_000, 200, 2400, 60.0),
 }
+DEFAULT_BAND = "ULTRA"
+
+# Bumped whenever a band is retuned, so a running receiver can notice and
+# rebuild its matched filters instead of listening on the old frequency.
+_BAND_REV = [0]
+
+
+def band_revision() -> int:
+    return _BAND_REV[0]
+
+
+def max_tone_spread() -> float:
+    """Widest base->top tone distance any profile needs."""
+    return max(p.spacing * (p.n_tones - 1) for p in PROFILES.values())
+
+
+def check_band_freq(hz: float) -> str:
+    """Return '' if `hz` is a usable base frequency, else why it is not."""
+    if hz != hz or hz <= 0:
+        return "frequency must be a positive number"
+    probe = Band("probe", float(hz), max(b.lead for b in BANDS.values()),
+                 max(b.span for b in BANDS.values()), 60.0)
+    if probe.chirp_f0 < MIN_BAND_FREQ:
+        return (f"too low: the chirp would start at {probe.chirp_f0:.0f} Hz, "
+                f"below the {MIN_BAND_FREQ:.0f} Hz floor")
+    top = max(probe.chirp_f1, hz + max_tone_spread())
+    if top > MAX_BAND_FREQ:
+        return (f"too high: tones/chirp would reach {top:.0f} Hz, above the "
+                f"{MAX_BAND_FREQ:.0f} Hz ceiling (Nyquist is "
+                f"{SAMPLE_RATE // 2} Hz)")
+    return ""
+
+
+def set_band_base_freq(name: str, hz: float) -> Band:
+    """Retune a band's lowest data tone. Chirp and tones move with it."""
+    if name not in BANDS:
+        raise ValueError(f"unknown band {name!r}; known: {', '.join(BANDS)}")
+    why = check_band_freq(hz)
+    if why:
+        raise ValueError(why)
+    BANDS[name] = replace(BANDS[name], base_freq=float(hz))
+    _BAND_REV[0] += 1
+    return BANDS[name]
+
+
+def band_plan(name: str, profile_id: int | None = None) -> list[str]:
+    """Human-readable description of where a band currently sits."""
+    b = BANDS[name]
+    out = [f"band {b.name}: base {b.base_freq/1000:.3f} kHz, "
+           f"chirp {b.chirp_f0/1000:.3f}-{b.chirp_f1/1000:.3f} kHz "
+           f"({'AUDIBLE' if b.audible else 'inaudible to most people'})"]
+    for pid in (PROFILES if profile_id is None else [profile_id]):
+        p = PROFILES[pid]
+        f = tone_freqs(p, b)
+        out.append(f"  profile {pid} {p.name:7s} {p.n_tones}-FSK  tones "
+                   + ", ".join(f"{x/1000:.3f}" for x in f) + " kHz")
+    return out
 
 # Detection threshold for the normalized matched filter.
 #
@@ -283,14 +364,15 @@ class PreambleDetector:
 
 
 # --------------------------------------------------------------------------- #
-# Modulation profiles -- this is the extension point for adaptivity.
-# Each profile = a band of tones + symbol timing. RX/TX pick a profile per-frame.
+# Modulation profiles -- HOW to modulate: tone spacing and symbol timing, no
+# absolute frequencies. A profile is band-agnostic, so the same FAST/NORMAL/
+# ROBUST choice applies whether the link is running inaudibly at 18 kHz or
+# audibly at 3 kHz. Where the tones actually land comes from the Band.
+# This is also the extension point for adaptivity; ids travel in the header.
 # --------------------------------------------------------------------------- #
 @dataclass(frozen=True)
 class Profile:
     name: str
-    band: str                 # key into BANDS
-    base_freq: float          # Hz, lowest tone
     spacing: float            # Hz between tones
     bits_per_symbol: int      # M-FSK: 2 -> 4 tones, 3 -> 8 tones
     symbol_ms: float          # tone duration
@@ -299,10 +381,6 @@ class Profile:
     @property
     def n_tones(self) -> int:
         return 1 << self.bits_per_symbol
-
-    @property
-    def freqs(self) -> np.ndarray:
-        return self.base_freq + self.spacing * np.arange(self.n_tones)
 
     @property
     def symbol_samples(self) -> int:
@@ -322,33 +400,47 @@ class Profile:
         return self.bits_per_symbol * SAMPLE_RATE / self.step_samples
 
 
-# Profiles 0-2 live in the near-ultrasonic band, fast -> robust. Profile 3 is the
-# audible fallback for hardware that cannot pass 18 kHz. IDs travel in the header.
 PROFILES = {
     # FAST is 4-FSK rather than 8-FSK on purpose. Eight tones only fit in the
     # usable 18.0-19.5 kHz window at ~170 Hz spacing, and measured over the air
     # that spacing loses to reverb (~0.5-2% symbol errors, enough to fail whole
     # frames). Four tones 400 Hz apart measured at or near 0% while still
     # running 64% faster than NORMAL, because the symbols are shorter.
-    0: Profile("FAST",    "ULTRA", 18_200, 400, 2, 15, 5),   # 4-FSK, 18.20-19.40 kHz
-    1: Profile("NORMAL",  "ULTRA", 18_200, 200, 2, 25, 8),   # 4-FSK, 18.20-18.80 kHz
-    2: Profile("ROBUST",  "ULTRA", 18_200, 300, 2, 45, 15),  # 4-FSK, wide spacing
-    3: Profile("AUDIBLE", "AUDIO",  3_000, 250, 3, 20, 6),   # 8-FSK, 3.00- 4.75 kHz
+    0: Profile("FAST",   400, 2, 15, 5),    # base .. base+1200 Hz
+    1: Profile("NORMAL", 200, 2, 25, 8),    # base .. base+ 600 Hz
+    2: Profile("ROBUST", 300, 2, 45, 15),   # base .. base+ 900 Hz
 }
 DEFAULT_PROFILE = 1
+ALL_PROFILES = list(PROFILES)
 
 
-def profiles_in_band(band_name: str) -> list[int]:
-    return [pid for pid, p in PROFILES.items() if p.band == band_name]
+def tone_freqs(profile: Profile, band: Band) -> np.ndarray:
+    """The absolute M-FSK tone frequencies for a profile in a given band."""
+    return band.base_freq + profile.spacing * np.arange(profile.n_tones)
 
 
 # --------------------------------------------------------------------------- #
 # M-FSK modulator / demodulator
 # --------------------------------------------------------------------------- #
+@lru_cache(maxsize=64)
+def _dft_kernel(n: int, base: float, spacing: float, n_tones: int) -> np.ndarray:
+    """(n, n_tones) complex DFT kernel at the exact tone frequencies.
+
+    Correlating against the exact frequencies beats picking the nearest FFT bin:
+    short symbols have coarse bins and the tones do not land on them. Cached
+    because the fine-sync search rebuilds a demodulator on every trial offset.
+    """
+    t = np.arange(n) / SAMPLE_RATE
+    freqs = base + spacing * np.arange(n_tones)
+    return (np.exp(-2j * np.pi * np.outer(t, freqs))
+            * np.hanning(n)[:, None]).astype(np.complex64)
+
+
 class MFSKModulator:
-    def __init__(self, profile: Profile):
+    def __init__(self, profile: Profile, band: Band):
         self.p = profile
-        self._mat: np.ndarray | None = None
+        self.band = band
+        self.freqs = tone_freqs(profile, band)
 
     # ---- TX ---------------------------------------------------------------- #
     def _tone(self, freq: float, n: int) -> np.ndarray:
@@ -368,7 +460,8 @@ class MFSKModulator:
             bits = np.concatenate([bits, np.zeros(pad, dtype=np.uint8)])
         symbols = (bits.reshape(-1, bps) @ (1 << np.arange(bps)[::-1])).astype(int)
         guard = np.zeros(p.guard_samples, dtype=np.float32)
-        tones = {s: self._tone(p.freqs[s], p.symbol_samples) for s in set(symbols.tolist())}
+        tones = {s: self._tone(self.freqs[s], p.symbol_samples)
+                 for s in set(symbols.tolist())}
         out = []
         for s in symbols:
             out.append(tones[s])
@@ -377,18 +470,8 @@ class MFSKModulator:
 
     # ---- RX ---------------------------------------------------------------- #
     def _matrix(self) -> np.ndarray:
-        """(symbol_samples, n_tones) complex DFT kernel at the exact tone freqs.
-
-        Correlating against the exact frequencies beats picking the nearest FFT
-        bin: short symbols have coarse bins and the tones do not land on them.
-        """
-        if self._mat is None:
-            n = self.p.symbol_samples
-            t = np.arange(n) / SAMPLE_RATE
-            win = np.hanning(n)
-            self._mat = (np.exp(-2j * np.pi * np.outer(t, self.p.freqs))
-                         * win[:, None]).astype(np.complex64)
-        return self._mat
+        return _dft_kernel(self.p.symbol_samples, self.band.base_freq,
+                           self.p.spacing, self.p.n_tones)
 
     def demod(self, audio: np.ndarray, start: int, n_symbols: int):
         """Return (symbols, confidence). confidence = mean winner/runner-up ratio."""
@@ -446,10 +529,11 @@ def frame_samples(payload_len: int, p: Profile) -> int:
     return (n - 1) * p.step_samples + p.symbol_samples if n else 0
 
 
-def packet_duration_s(payload_len: int, profile_id: int) -> float:
+def packet_duration_s(payload_len: int, profile_id: int,
+                      band_name: str = DEFAULT_BAND) -> float:
     p = PROFILES[profile_id]
     total = (int(SAMPLE_RATE * (LEADIN_MS + GAP_MS + TAIL_MS) / 1000)
-             + BANDS[p.band].chirp_samples + frame_samples(payload_len, p))
+             + BANDS[band_name].chirp_samples + frame_samples(payload_len, p))
     return total / SAMPLE_RATE
 
 
@@ -463,13 +547,14 @@ def build_frame_bits(payload: bytes, profile_id: int) -> np.ndarray:
     return interleave(hamming_encode(body))
 
 
-def encode_packet(payload: bytes, profile_id: int) -> np.ndarray:
+def encode_packet(payload: bytes, profile_id: int,
+                  band_name: str = DEFAULT_BAND) -> np.ndarray:
     """Full TX audio for one packet: silence + chirp preamble + modulated frame."""
-    p = PROFILES[profile_id]
-    mod = MFSKModulator(p)
+    band = BANDS[band_name]
+    mod = MFSKModulator(PROFILES[profile_id], band)
     audio = np.concatenate([
         np.zeros(int(SAMPLE_RATE * LEADIN_MS / 1000), dtype=np.float32),
-        make_chirp(BANDS[p.band]),
+        make_chirp(band),
         np.zeros(int(SAMPLE_RATE * GAP_MS / 1000), dtype=np.float32),
         mod.bits_to_audio(build_frame_bits(payload, profile_id)),
         np.zeros(int(SAMPLE_RATE * TAIL_MS / 1000), dtype=np.float32),
@@ -478,10 +563,9 @@ def encode_packet(payload: bytes, profile_id: int) -> np.ndarray:
     return (audio * (0.9 / peak)).astype(np.float32)
 
 
-def data_offset_in_packet(profile_id: int) -> int:
+def data_offset_in_packet(band_name: str = DEFAULT_BAND) -> int:
     """Samples from the start of the chirp to the first data symbol."""
-    p = PROFILES[profile_id]
-    return BANDS[p.band].chirp_samples + int(SAMPLE_RATE * GAP_MS / 1000)
+    return BANDS[band_name].chirp_samples + int(SAMPLE_RATE * GAP_MS / 1000)
 
 
 # --------------------------------------------------------------------------- #
@@ -499,10 +583,12 @@ class DecodeResult:
 
 
 def decode_header(audio: np.ndarray, start: int, profile_id: int,
+                  band_name: str = DEFAULT_BAND,
                   max_payload: int = 4096) -> DecodeResult:
     """Try to read the 6-byte header body at an exact sample offset."""
     p = PROFILES[profile_id]
-    bits, conf = MFSKModulator(p).audio_to_bits(audio, header_symbols(p), start)
+    mod = MFSKModulator(p, BANDS[band_name])
+    bits, conf = mod.audio_to_bits(audio, header_symbols(p), start)
     if bits.size < hamming_bit_count(HEADER_BODY_BYTES):
         return DecodeResult(False, reason="short read", offset=start)
     body = hamming_decode(deinterleave(bits[:hamming_bit_count(HEADER_BODY_BYTES)]))
@@ -520,12 +606,13 @@ def decode_header(audio: np.ndarray, start: int, profile_id: int,
                         length=length, confidence=conf)
 
 
-def decode_frame(audio: np.ndarray, start: int, profile_id: int,
-                 length: int) -> DecodeResult:
+def decode_frame(audio: np.ndarray, start: int, profile_id: int, length: int,
+                 band_name: str = DEFAULT_BAND) -> DecodeResult:
     """Decode the full frame once the header told us how long it is."""
     p = PROFILES[profile_id]
     total_body = length + FRAME_OVERHEAD_BYTES
-    bits, conf = MFSKModulator(p).audio_to_bits(audio, frame_symbols(length, p), start)
+    mod = MFSKModulator(p, BANDS[band_name])
+    bits, conf = mod.audio_to_bits(audio, frame_symbols(length, p), start)
     need = hamming_bit_count(padded_body_bytes(length))
     if bits.size < need:
         return DecodeResult(False, reason="truncated frame", offset=start)
@@ -552,7 +639,7 @@ def sync_offsets(p: Profile, span_ms: float = 4.0, step_ms: float = 0.75) -> np.
 
 
 def try_decode(audio: np.ndarray, profile_ids, data_start: int = 0,
-               max_payload: int = 4096):
+               band_name: str = DEFAULT_BAND, max_payload: int = 4096):
     """Locate and decode a frame whose data begins near `data_start`.
 
     Returns a successful DecodeResult, or the most informative failure.
@@ -566,12 +653,12 @@ def try_decode(audio: np.ndarray, profile_ids, data_start: int = 0,
             start = data_start + int(off)
             if start < 0:
                 continue
-            hdr = decode_header(audio, start, pid, max_payload)
+            hdr = decode_header(audio, start, pid, band_name, max_payload)
             if not hdr.ok:
                 if hdr.reason != "short read":
                     best = hdr if best.reason == "no candidate" else best
                 continue
-            res = decode_frame(audio, start, pid, hdr.length)
+            res = decode_frame(audio, start, pid, hdr.length, band_name)
             res.profile_id = hdr.profile_id
             if res.ok:
                 return res

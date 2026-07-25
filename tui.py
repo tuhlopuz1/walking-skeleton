@@ -7,15 +7,18 @@ Run:  python tui.py
 Build: pyinstaller --onefile --name acoustic_modem tui.py
 
 Commands (type in the input box):
+    /mode audible|inaudible   switch frequency band (must match on both devices)
+    /freq <kHz>       set the frequency the link runs on, e.g. /freq 18.6
+    /freq             show the current tone plan
+    /profile 0..2     modulation profile (FAST/NORMAL/ROBUST) - any band
     /rx on | off      start / stop listening
-    /profile 0..3     modulation profile (FAST/NORMAL/ROBUST/AUDIBLE)
     /file <path>      send a file
     /devices          list audio devices
     /in <n>  /out <n> pick input / output device by number
     /probe            measure what this speaker+mic pair can actually carry
     /selftest         encode->decode in memory (no sound card)
     /loopback         full speaker->mic round trip on this machine
-    /thresh <x>       preamble detection threshold (default 0.15)
+    /thresh <x>       preamble detection threshold (default 0.20)
     /clear  /quit
     <anything else>   sent as a text message
 """
@@ -40,10 +43,23 @@ except ImportError:
 
 import trx as trxmod
 from trx import Transceiver, HAVE_AUDIO, AUDIO_ERROR, PROFILES, list_devices
+from modem_core import BANDS, check_band_freq
+
+# Captured at import, before any /freq, so "/freq reset" has somewhere to go.
+DEFAULT_BASE_FREQ = {name: b.base_freq for name, b in BANDS.items()}
 
 LOG: list[str] = []
-STATUS = {"profile": 1, "note": "", "busy": False}
+STATUS = {"note": "", "busy": False}
 _loglock = threading.Lock()
+
+# "audible" / "inaudible" is how a user thinks about this; ULTRA / AUDIO is how
+# the protocol names it. Accept both, plus the obvious shorthands.
+MODE_ALIASES = {
+    "inaudible": "ULTRA", "ultra": "ULTRA", "ultrasonic": "ULTRA",
+    "ultrasound": "ULTRA", "us": "ULTRA", "hidden": "ULTRA", "silent": "ULTRA",
+    "audible": "AUDIO", "audio": "AUDIO", "hearable": "AUDIO",
+    "sound": "AUDIO", "loud": "AUDIO",
+}
 
 
 def log(line: str):
@@ -86,13 +102,16 @@ def _bar(db: float, lo: float = -70.0, hi: float = -6.0, width: int = 16) -> str
 
 
 def header_text():
-    p = PROFILES[STATUS["profile"]]
+    pid = trx.active_profile
+    p = PROFILES[pid]
+    b = BANDS[trx.active_band]
     audio = "OK" if HAVE_AUDIO else f"NO AUDIO ({AUDIO_ERROR[:30]})"
     rx = "ON " if trx.rx_running else "OFF"
+    mode = "audible" if b.audible else "inaudible"
     return [("class:title",
-             f" ACOUSTIC MODEM | RX:{rx} | profile {STATUS['profile']}:{p.name} "
-             f"({p.base_freq/1000:.2f}kHz {p.n_tones}-FSK {p.band}) | audio:{audio} "
-             f"| {STATUS['note']} ")]
+             f" ACOUSTIC MODEM | RX:{rx} | {mode} @ {b.base_freq/1000:.2f}kHz "
+             f"| profile {pid}:{p.name} ({p.n_tones}-FSK, {p.bitrate:.0f}b/s) "
+             f"| audio:{audio} | {STATUS['note']} ")]
 
 
 def meter_text():
@@ -143,10 +162,11 @@ def handle_command(text: str):
     head = cmd[0].lower() if cmd else ""
 
     if head in ("/help", "/?"):
-        log("/rx on|off  /profile 0..3  /file <path>  /devices  /in <n>  /out <n>")
+        log("/mode audible|inaudible   switch band (set the SAME on both devices)")
+        log("/freq <kHz>               tune the link, e.g. /freq 18.6   (/freq = show)")
+        log("/profile 0|1|2            0 FAST  1 NORMAL  2 ROBUST -- works in any band")
+        log("/rx on|off  /file <path>  /devices  /in <n>  /out <n>")
         log("/probe  /selftest  /loopback  /thresh <x>  /clear  /quit")
-        log("profiles: 0 FAST  1 NORMAL  2 ROBUST (18-19kHz)  3 AUDIBLE (3-5kHz, "
-            "use if 18kHz does not get through)")
     elif head == "/quit":
         trx.stop_rx()
         if app is not None:
@@ -184,19 +204,67 @@ def handle_command(text: str):
             except Exception as exc:
                 log(f"!! RX error: {type(exc).__name__}: {exc}")
                 log("   try '/devices' then '/in <n>' to pick a mic that supports 48 kHz")
+    elif head in ("/mode", "/band"):
+        arg = cmd[1].lower() if len(cmd) > 1 else ""
+        target = MODE_ALIASES.get(arg, arg.upper() if arg.upper() in BANDS else "")
+        if not target:
+            b = BANDS[trx.active_band]
+            log(f"mode: {'audible' if b.audible else 'inaudible'} "
+                f"({trx.active_band} @ {b.base_freq/1000:.3f} kHz)")
+            log("usage: /mode audible   |   /mode inaudible")
+            return
+        trx.set_band(target)
+        b = BANDS[target]
+        log(f"mode -> {'AUDIBLE' if b.audible else 'inaudible'} "
+            f"({target} @ {b.base_freq/1000:.3f} kHz)")
+        log("   set the SAME mode on the other device -- it is a channel, not a "
+            "preference")
+        for line in trx.plan():
+            log("   " + line)
+    elif head == "/freq":
+        if len(cmd) < 2:
+            for line in trx.plan():
+                log("   " + line)
+            log("usage: /freq 18.6 (kHz) | /freq 18600 (Hz) | /freq reset")
+            return
+        if cmd[1].lower() in ("reset", "default"):
+            hz = DEFAULT_BASE_FREQ[trx.active_band]
+        else:
+            try:
+                val = float(cmd[1].replace(",", "."))
+            except ValueError:
+                log("usage: /freq 18.6 (kHz) | /freq 18600 (Hz) | /freq reset")
+                return
+            hz = val * 1000.0 if val < 100 else val  # accept kHz or Hz
+        why = check_band_freq(hz)
+        if why:
+            log(f"cannot tune to {hz:.0f} Hz: {why}")
+            return
+        was_rx = trx.rx_running
+        trx.set_frequency(hz)
+        b = BANDS[trx.active_band]
+        log(f"{trx.active_band} -> base {b.base_freq/1000:.3f} kHz")
+        if b.audible:
+            log("   NOTE: this is in the audible range -- you will hear the data.")
+        log("   set the SAME frequency on the other device.")
+        for line in trx.plan():
+            log("   " + line)
+        if not was_rx:
+            log("   (takes effect for RX when you '/rx on')")
     elif head == "/profile":
         try:
             pid = int(cmd[1])
             if pid not in PROFILES:
                 raise ValueError
         except (IndexError, ValueError):
-            log("usage: /profile 0|1|2|3")
+            log("usage: /profile 0|1|2   (0 FAST, 1 NORMAL, 2 ROBUST)")
             return
-        STATUS["profile"] = pid
         trx.active_profile = pid
         p = PROFILES[pid]
-        log(f"profile -> {p.name} ({p.band} band, {p.n_tones}-FSK, "
-            f"{p.bitrate:.0f} raw bit/s). Set the SAME profile on the other device.")
+        log(f"profile -> {p.name} ({p.n_tones}-FSK, {p.bitrate:.0f} raw bit/s). "
+            f"Receiver auto-adapts, but matching it is faster.")
+        for line in trx.plan():
+            log("   " + line)
     elif head == "/thresh":
         try:
             trx.detect_threshold = float(cmd[1])
@@ -206,15 +274,16 @@ def handle_command(text: str):
         log(f"detection threshold -> {trx.detect_threshold:.2f} "
             f"({'restart RX to apply' if trx.rx_running else 'applies on /rx on'})")
     elif head == "/selftest":
-        log(">> selftest (no sound card)")
-        _bg(_run_lines, trxmod.selftest, -1)
+        log(">> selftest at the current tuning (no sound card)")
+        _bg(_run_lines, trxmod.selftest, -1, trx.active_band)
     elif head == "/probe":
         log(">> probing speaker -> mic frequency response ...")
-        _bg(_run_lines, trxmod.probe, trx.device_in, trx.device_out)
+        _bg(_run_lines, trxmod.probe, trx.device_in, trx.device_out, 0.3,
+            trx.active_band)
     elif head == "/loopback":
-        log(f">> loopback on profile {STATUS['profile']} ...")
-        _bg(_run_lines, trxmod.loopback, STATUS["profile"], "loopback test",
-            trx.device_in, trx.device_out)
+        log(f">> loopback: profile {trx.active_profile} on {trx.active_band} ...")
+        _bg(_run_lines, trxmod.loopback, trx.active_profile, "loopback test",
+            trx.device_in, trx.device_out, trx.active_band)
     elif head == "/file":
         path = text[5:].strip().strip('"')
         if not os.path.isfile(path):
