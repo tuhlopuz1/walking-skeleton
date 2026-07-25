@@ -19,7 +19,7 @@
 //! # Events
 //!
 //! Everything the caller needs comes out of one [`Event`] channel rather than
-//! callbacks — logs, progress, and delivered messages alike. A UI can select on
+//! callbacks -- logs, progress, and delivered messages alike. A UI can select on
 //! it directly, and nothing is swallowed.
 
 use std::collections::HashMap;
@@ -57,7 +57,7 @@ pub const HANDSHAKE_RETRIES: usize = 3;
 /// Deliberately generous. Opening a fresh output stream per packet was measured
 /// at ~0.75 s on hardware whose descriptor claims 0.18 s, so reported latency
 /// cannot size this. The asymmetry settles it: waiting too long costs nothing
-/// when the ack does arrive — the wait ends on the ack, not on the clock — while
+/// when the ack does arrive -- the wait ends on the ack, not on the clock -- while
 /// timing out early costs a full data packet resend, which is tens of seconds.
 pub const TURNAROUND_S: f64 = 2.5;
 
@@ -65,7 +65,7 @@ pub const TURNAROUND_S: f64 = 2.5;
 ///
 /// A sender keeps its receiver muted for a moment after it stops playing, to let
 /// the room's echo of its own packet decay. A peer that replies *inside* that
-/// window loses the first thing it says — the chirp preamble — and the exchange
+/// window loses the first thing it says -- the chirp preamble -- and the exchange
 /// stalls with neither side at fault. This guard must exceed that tail.
 pub const REPLY_GUARD_S: f64 = 0.4;
 
@@ -229,8 +229,8 @@ impl Shared {
 
     /// Block until a control frame addressed to us matches, or time runs out.
     ///
-    /// Frames that do not match — a stray ack, or a reply from a device that is
-    /// not our peer — are discarded and the wait continues. That is the identity
+    /// Frames that do not match -- a stray ack, or a reply from a device that is
+    /// not our peer -- are discarded and the wait continues. That is the identity
     /// check the whole scheme rests on.
     fn await_ctrl<F>(&self, kinds: &[u8], deadline: Instant, matches: F) -> Option<CtrlFrame>
     where
@@ -323,7 +323,7 @@ impl Transceiver {
         self.shared.bands.lock().unwrap().clone()
     }
 
-    /// Retune a band. Both ends must agree — it is a channel, not a preference.
+    /// Retune a band. Both ends must agree -- it is a channel, not a preference.
     /// A running receiver notices the revision bump and rebuilds its filters.
     pub fn set_frequency(&self, band: &str, hz: f64) -> Result<Band, String> {
         let b = self.shared.bands.lock().unwrap().set_base_freq(band, hz)?;
@@ -397,12 +397,12 @@ impl Transceiver {
 
     /// Explicit hello -> hello-ack, with no payload attached.
     ///
-    /// Sending does not need this — the first fragment introduces us by itself.
+    /// Sending does not need this -- the first fragment introduces us by itself.
     /// It answers "is anyone out there?" without committing to a transfer, which
     /// is what you want when a link is not working.
     pub fn discover(&self) -> Result<DeviceId, String> {
         if !self.is_running() {
-            return Err("start RX first — discovery must hear the reply".into());
+            return Err("start RX first -- discovery must hear the reply".into());
         }
         let cfg = self.config();
         let band = self.shared.active_band();
@@ -474,7 +474,7 @@ impl Transceiver {
         let arq = cfg.arq && self.is_running();
         if cfg.arq && !self.is_running() {
             self.shared
-                .log(Level::Warn, "ARQ needs RX on to hear ACKs — sending blind");
+                .log(Level::Warn, "ARQ needs RX on to hear ACKs -- sending blind");
         }
 
         // No separate hello: the first fragment goes out addressed to whoever we
@@ -538,7 +538,7 @@ impl Transceiver {
                 self.shared.log(
                     Level::Warn,
                     format!(
-                        "frag {}/{total} unacked (attempt {attempt}/{retries}) — resending",
+                        "frag {}/{total} unacked (attempt {attempt}/{retries}) -- resending",
                         idx + 1
                     ),
                 );
@@ -640,7 +640,7 @@ fn rx_loop(sh: &Arc<Shared>, audio: Receiver<Vec<f32>>) -> Result<(), String> {
             search = origin;
             buf.clear();
             state = RxState::Search;
-            sh.log(Level::Info, "retuned — matched filters rebuilt");
+            sh.log(Level::Info, "retuned -- matched filters rebuilt");
             continue;
         }
 
@@ -808,7 +808,7 @@ fn rx_loop(sh: &Arc<Shared>, audio: Receiver<Vec<f32>>) -> Result<(), String> {
             let p = *profile(lock_pid).unwrap();
             let m = MfskModulator::new(p, det_band);
             // The offset that decoded the header is not always the best one for
-            // the whole body — reverb shifts the optimum by a millisecond or two.
+            // the whole body -- reverb shifts the optimum by a millisecond or two.
             // The audio is already buffered, so on a CRC failure retry the
             // neighbouring offsets before giving up.
             let mut res = decode_frame(&buf, (data_start + lock_off - origin) as isize, &m, lock_len);
@@ -841,7 +841,7 @@ fn rx_loop(sh: &Arc<Shared>, audio: Receiver<Vec<f32>>) -> Result<(), String> {
                     },
                 );
                 // Replies go out on the profile and band the frame arrived on,
-                // not on ours — the sender is listening there.
+                // not on ours -- the sender is listening there.
                 handle_frame(sh, &res.payload, lock_pid, &det_band);
             } else {
                 sh.stats.lock().unwrap().rx_bad += 1;
@@ -900,10 +900,10 @@ fn handle_frame(sh: &Arc<Shared>, payload: &[u8], pid: usize, band: &Band) {
     match frame {
         Frame::Ctrl(c) if c.kind == T_HELLO => {
             // Someone is about to transmit. Answer with our own id so they know
-            // who they are talking to — that id gates every later ack.
+            // who they are talking to -- that id gates every later ack.
             sh.log(
                 Level::Info,
-                format!("hello from {:04X} — answering as {me:04X}", c.src),
+                format!("hello from {:04X} -- answering as {me:04X}", c.src),
             );
             sh.peer_id.store(c.src, Ordering::SeqCst);
             let _ = sh.events.send(Event::PeerChanged(c.src));
@@ -923,12 +923,12 @@ fn handle_frame(sh: &Arc<Shared>, payload: &[u8], pid: usize, band: &Band) {
         }
         Frame::Data { hdr, payload } => {
             if hdr.dst != me && hdr.dst != BROADCAST {
-                sh.log(Level::Info, format!("frag for {:04X}, not us — ignored", hdr.dst));
+                sh.log(Level::Info, format!("frag for {:04X}, not us -- ignored", hdr.dst));
                 return;
             }
             if hdr.ack_req {
                 // The sender is blocked until it hears from us. Acknowledge
-                // before reassembling — its clock is already running. A
+                // before reassembling -- its clock is already running. A
                 // broadcast frame is acked too: that is how a sender that has
                 // never met us learns our id.
                 sh.peer_id.store(hdr.src, Ordering::SeqCst);
@@ -960,12 +960,12 @@ fn reassemble(sh: &Arc<Shared>, hdr: FragHeader, frag: Vec<u8>) {
         done.retain(|_, t| now.duration_since(*t) <= REASM_TIMEOUT);
         // A lost ack makes the sender resend a fragment we already have. It must
         // still be acknowledged (done above, unconditionally) or the sender never
-        // advances — but it must not be delivered twice.
+        // advances -- but it must not be delivered twice.
         if done.contains_key(&key) {
             sh.log(
                 Level::Info,
                 format!(
-                    "duplicate frag {}/{} of msg {:04X} — re-acked, not re-delivered",
+                    "duplicate frag {}/{} of msg {:04X} -- re-acked, not re-delivered",
                     hdr.frag_idx + 1,
                     hdr.frag_total,
                     hdr.msg_id
@@ -992,7 +992,7 @@ fn reassemble(sh: &Arc<Shared>, hdr: FragHeader, frag: Vec<u8>) {
             sh.log(
                 Level::Warn,
                 format!(
-                    "frag {} of msg {:04X} claims {} fragments, not {} — ignored",
+                    "frag {} of msg {:04X} claims {} fragments, not {} -- ignored",
                     hdr.frag_idx + 1,
                     hdr.msg_id,
                     hdr.frag_total,

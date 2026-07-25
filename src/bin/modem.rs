@@ -1,7 +1,7 @@
 //! CLI for the acoustic modem.
 //!
 //! The `encode`/`decode` subcommands read and write raw little-endian f32 mono
-//! at 48 kHz — the same thing the DSP passes around internally. That is what
+//! at 48 kHz -- the same thing the DSP passes around internally. That is what
 //! lets the Python reference and this implementation check each other on the
 //! wire without either of them needing a sound card.
 
@@ -136,6 +136,36 @@ fn live(o: &Opts) -> (Transceiver, std::sync::mpsc::Receiver<Event>) {
         }
     }
     (trx, events)
+}
+
+/// Prints events, collapsing the progress stream.
+///
+/// A receiver emits progress on every audio block, which for a 30-second ROBUST
+/// frame is hundreds of lines saying almost the same thing. Only report when it
+/// has actually moved.
+#[derive(Default)]
+struct Printer {
+    last_pct: Option<u8>,
+    last_note: String,
+}
+
+impl Printer {
+    fn print(&mut self, ev: &Event) {
+        match ev {
+            Event::Progress { pct, note } => {
+                let moved = self.last_pct.is_none_or(|p| pct.abs_diff(p) >= 10 || *pct == 100);
+                if moved || *note != self.last_note {
+                    println!("       {note} [{pct}%]");
+                    self.last_pct = Some(*pct);
+                    self.last_note = note.clone();
+                }
+            }
+            other => {
+                self.last_pct = None;
+                print_event(other);
+            }
+        }
+    }
 }
 
 fn print_event(ev: &Event) {
@@ -273,15 +303,16 @@ fn main() {
                 std::process::exit(1);
             }
             println!(
-                "listening as {:04X} on {} @ {:.2} kHz, profile {} — Ctrl-C to stop",
+                "listening as {:04X} on {} @ {:.2} kHz, profile {} -- Ctrl-C to stop",
                 trx.device_id(),
                 o.band.name,
                 o.band.base_freq / 1000.0,
                 o.profile
             );
             // The receiver runs on its own thread; this one just relays events.
+            let mut printer = Printer::default();
             for ev in events.iter() {
-                print_event(&ev);
+                printer.print(&ev);
             }
         }
 
@@ -300,8 +331,9 @@ fn main() {
                 }
             }
             let printer = std::thread::spawn(move || {
+                let mut p = Printer::default();
                 for ev in events.iter() {
-                    print_event(&ev);
+                    p.print(&ev);
                 }
             });
             let result = trx.send_text(&text);

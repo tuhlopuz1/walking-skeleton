@@ -1,7 +1,7 @@
 //! Audio I/O, kept behind a trait.
 //!
 //! The DSP and the protocol never touch cpal directly, so the whole stack stays
-//! testable on a machine with no sound card — the property that made the Python
+//! testable on a machine with no sound card -- the property that made the Python
 //! version debuggable. Tests substitute a virtual room; production uses
 //! [`CpalBackend`].
 

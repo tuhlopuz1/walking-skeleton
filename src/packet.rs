@@ -219,7 +219,7 @@ pub fn default_sync_offsets() -> Vec<isize> {
 
 /// Locate and decode a frame whose data begins near `data_start`.
 ///
-/// Returns a successful result, or the most informative failure — "marker
+/// Returns a successful result, or the most informative failure -- "marker
 /// mismatch" tells you the timing is off, "frame CRC fail" tells you the timing
 /// was right and the signal was not.
 pub fn try_decode(

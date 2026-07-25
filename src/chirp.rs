@@ -77,7 +77,7 @@ pub struct PreambleDetector {
 
 impl PreambleDetector {
     /// Windows quieter than this RMS are treated as silence rather than
-    /// normalized — otherwise 0/0 turns a digitally silent gap into a fake peak.
+    /// normalized -- otherwise 0/0 turns a digitally silent gap into a fake peak.
     pub const SILENCE_RMS: f64 = 1e-4;
 
     pub fn new(band: Band, threshold: f32) -> Self {
@@ -166,7 +166,7 @@ impl PreambleDetector {
 
     /// Indices of distinct local maxima above the threshold, strongest first.
     ///
-    /// Peaks within one template length of each other are one event — a chirp
+    /// Peaks within one template length of each other are one event -- a chirp
     /// correlates over its whole width, so the raw score has a broad hump.
     pub fn peaks(&self, sc: &[f32]) -> Vec<usize> {
         let above: Vec<usize> = sc

@@ -1,4 +1,4 @@
-//! Modulation profiles — HOW to modulate: tone spacing and symbol timing, with
+//! Modulation profiles -- HOW to modulate: tone spacing and symbol timing, with
 //! no absolute frequencies in them.
 //!
 //! A profile is band-agnostic, so FAST/NORMAL/ROBUST applies whether the link
@@ -76,7 +76,7 @@ pub fn profiles_preferring(first: usize) -> Vec<usize> {
     ids
 }
 
-/// Widest base->top tone distance any profile needs — used when checking that a
+/// Widest base->top tone distance any profile needs -- used when checking that a
 /// retuned band still fits under Nyquist.
 pub fn max_tone_spread() -> f64 {
     PROFILES

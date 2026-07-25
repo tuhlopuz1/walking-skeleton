@@ -129,7 +129,7 @@ impl MfskModulator {
         (symbols, conf_sum / n_symbols as f64)
     }
 
-    /// Demodulate and unpack to bits, MSB first — the inverse of the packing in
+    /// Demodulate and unpack to bits, MSB first -- the inverse of the packing in
     /// [`MfskModulator::bits_to_audio`].
     pub fn audio_to_bits(&self, audio: &[f32], n_symbols: usize, start: isize) -> (Vec<u8>, f64) {
         let (symbols, conf) = self.demod(audio, start, n_symbols);

@@ -4,14 +4,14 @@
 //!
 //! Layering, lowest first:
 //!
-//! - [`fec`] — CRC-16, Hamming(7,4), block interleaver.
-//! - [`profile`] / [`band`] — how to modulate, and where in the spectrum.
-//! - [`chirp`] — preamble generation and the normalized matched filter.
-//! - [`mfsk`] — the modulator/demodulator.
-//! - [`packet`] — framing, encoding, and decoding whole packets.
+//! - [`fec`] -- CRC-16, Hamming(7,4), block interleaver.
+//! - [`profile`] / [`band`] -- how to modulate, and where in the spectrum.
+//! - [`chirp`] -- preamble generation and the normalized matched filter.
+//! - [`mfsk`] -- the modulator/demodulator.
+//! - [`packet`] -- framing, encoding, and decoding whole packets.
 //!
 //! Everything up to `packet` is pure DSP over `&[f32]` with no audio device in
-//! sight, so it is testable without a sound card — the property that made the
+//! sight, so it is testable without a sound card -- the property that made the
 //! Python version debuggable, and worth keeping.
 
 pub mod audio;
@@ -48,8 +48,8 @@ pub const LEAD_GUARD_MS: f64 = 50.0;
 /// the air, the data region of a packet reaches 0.21–0.26. Every false lock on
 /// the payload blinds the receiver for a header's worth of audio.
 ///
-/// Rather than raise the threshold above 0.26 — which would drop real chirps
-/// that measure as low as 0.30 — payload hits are rejected structurally by the
+/// Rather than raise the threshold above 0.26 -- which would drop real chirps
+/// that measure as low as 0.30 -- payload hits are rejected structurally by the
 /// in-band lead-in silence check. That frees this to sit low enough not to miss
 /// weak preambles while keeping a 4–10x margin over room noise.
 pub const DETECT_THRESHOLD: f32 = 0.20;

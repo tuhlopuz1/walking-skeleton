@@ -1,4 +1,4 @@
-//! Diagnostics — these answer "is the link dead, or is my hardware dead?"
+//! Diagnostics -- these answer "is the link dead, or is my hardware dead?"
 //!
 //! All three run over the [`Backend`] trait, so they work against a real sound
 //! card or a virtual room alike.
@@ -188,7 +188,7 @@ pub fn probe(backend: &Arc<dyn Backend>, band: &Band) -> Result<Vec<String>, Str
             band.base_freq / 1000.0
         ));
         if drop > 30.0 {
-            out.push("         Too weak — this hardware will not carry that tuning.".into());
+            out.push("         Too weak -- this hardware will not carry that tuning.".into());
         }
     }
     out.push(
@@ -248,7 +248,7 @@ pub fn loopback(
         ),
     ];
     if score < det.threshold {
-        out.push("FAIL: preamble not detected — the mic never heard the chirp.".into());
+        out.push("FAIL: preamble not detected -- the mic never heard the chirp.".into());
         out.push("      Raise the volume, or run `probe` to check the band.".into());
         return Ok(out);
     }
@@ -272,7 +272,7 @@ pub fn loopback(
     } else {
         out.push(format!("FAIL at decode: {}", r.reason));
         out.push(
-            "      Preamble was heard, so timing/SNR is marginal — try a slower profile \
+            "      Preamble was heard, so timing/SNR is marginal -- try a slower profile \
              or move the devices closer."
                 .into(),
         );

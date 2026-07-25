@@ -8,7 +8,7 @@
 ///
 /// One M-FSK symbol error corrupts up to `bits_per_symbol` *consecutive* bits,
 /// which without interleaving all land in one codeword and are uncorrectable.
-/// The depth is chosen so the 6-byte header is exactly one block — that is what
+/// The depth is chosen so the 6-byte header is exactly one block -- that is what
 /// lets a receiver de-interleave the header before it knows the frame length.
 pub const INTERLEAVE_CW: usize = 12;
 /// Bytes per interleaver block (two nibbles per byte).

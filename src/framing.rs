@@ -19,8 +19,8 @@ pub const ACK_HDR_LEN: usize = 9;
 
 pub const T_TEXT: u8 = 0x01;
 pub const T_FILE: u8 = 0x02;
-/// Explicit discovery. Not used before a send — the first data fragment already
-/// introduces us — but kept for "is anyone out there?" without a transfer.
+/// Explicit discovery. Not used before a send -- the first data fragment already
+/// introduces us -- but kept for "is anyone out there?" without a transfer.
 pub const T_HELLO: u8 = 0x10;
 pub const T_HELLO_ACK: u8 = 0x11;
 pub const T_ACK: u8 = 0x12;
@@ -104,7 +104,7 @@ pub fn encode_ack(src: DeviceId, dst: DeviceId, msg_id: u16, frag_idx: u16) -> V
     out
 }
 
-/// Parse one decoded packet payload. `None` means "malformed, ignore it" —
+/// Parse one decoded packet payload. `None` means "malformed, ignore it" --
 /// a frame that survived the CRC but is too short to be any known type.
 pub fn parse(payload: &[u8]) -> Option<Frame> {
     let kind = *payload.first()?;

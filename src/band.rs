@@ -1,4 +1,4 @@
-//! Bands — WHERE in the spectrum a link lives.
+//! Bands -- WHERE in the spectrum a link lives.
 //!
 //! A band fixes the lowest data tone and the chirp preamble that finds and
 //! time-aligns packets. Profiles say how to modulate and are band-agnostic, so
@@ -60,7 +60,7 @@ impl Band {
 }
 
 /// Near-ultrasonic: inaudible to most people, but consumer speakers and mics
-/// fall off a cliff above ~19.5 kHz. The chirp deliberately stops below that —
+/// fall off a cliff above ~19.5 kHz. The chirp deliberately stops below that --
 /// a sweep whose top half the hardware cannot reproduce only correlates on the
 /// part that survives, which throws away detection margin.
 pub const ULTRA: Band = Band { name: "ULTRA", base_freq: 18_200.0, lead: 400.0, span: 1400.0, chirp_ms: 60.0 };
@@ -98,7 +98,7 @@ impl BandSet {
         self.bands.iter().find(|b| b.name == name).copied()
     }
 
-    /// Panics only on a name that is not in the set — callers hold names that
+    /// Panics only on a name that is not in the set -- callers hold names that
     /// came from `all()` or from the `ULTRA`/`AUDIO` constants.
     pub fn expect(&self, name: &str) -> Band {
         self.get(name)
@@ -106,7 +106,7 @@ impl BandSet {
     }
 
     /// Retune a band's lowest data tone. The chirp and every profile's tones
-    /// move with it, so both ends must agree — it is a channel, not a preference.
+    /// move with it, so both ends must agree -- it is a channel, not a preference.
     pub fn set_base_freq(&mut self, name: &str, hz: f64) -> Result<Band, String> {
         check_band_freq(hz)?;
         let slot = self
