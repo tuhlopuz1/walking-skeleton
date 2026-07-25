@@ -173,6 +173,7 @@ def handle_command(text: str):
         log("/rx on|off  /file <path>  /devices  /in <n>  /out <n>")
         log("/id [hhhh]                this device's id (/id = show, /id A1B2 = set)")
         log("/arq on|off               per-fragment ACKs + resend (needs /rx on)")
+        log("/ping                     ask who is out there, without sending anything")
         log("/probe  /selftest  /loopback  /thresh <x>  /clear  /quit")
     elif head == "/quit":
         trx.stop_rx()
@@ -285,6 +286,18 @@ def handle_command(text: str):
             log(f"usage: /id A1B2  (4 hex digits, not 0000) -- {exc}")
             return
         log(f"device id -> {trx.device_id:04X}")
+    elif head == "/ping":
+        if not trx.rx_running:
+            log("/ping needs '/rx on' here -- it has to hear the reply")
+            return
+        log(">> hello ... (the peer must have '/rx on' too)")
+
+        def _ping():
+            peer = trx.discover()
+            log(f"   peer {peer:04X} answered" if peer
+                else "   nobody answered -- check /rx on, /mode and /freq "
+                     "on the other device")
+        _bg(_ping)
     elif head == "/arq":
         if len(cmd) > 1 and cmd[1].lower() == "off":
             trx.arq = False

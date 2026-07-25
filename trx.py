@@ -73,9 +73,16 @@ ACK_HDR = struct.Struct(">BHHHH")       # 9 B
 
 T_TEXT = 0x01
 T_FILE = 0x02
-T_HELLO = 0x10             # "I am about to transmit -- who is listening?"
-T_HELLO_ACK = 0x11         # "I am, and this is my id"
+T_HELLO = 0x10             # explicit discovery ("/ping"); not used before a send
+T_HELLO_ACK = 0x11         # "I am here, and this is my id"
 T_ACK = 0x12               # "I got fragment N of message M"
+
+# High bit of the type byte: "acknowledge this frame". A data frame that asks to
+# be acked IS the introduction -- it already carries our id, and the ack carries
+# the peer's. A separate hello round trip before every message would double the
+# air time of a short one for no extra information.
+ACK_REQ = 0x80
+TYPE_MASK = 0x7F
 
 BROADCAST = 0x0000         # dst everyone accepts and nobody acknowledges
 FRAG_PAYLOAD = 48          # bytes per fragment; small keeps frames short & retryable
@@ -257,6 +264,22 @@ class Transceiver:
                 return got[1]
         return BROADCAST
 
+    def discover(self, profile_id: int | None = None,
+                 band_name: str | None = None) -> int:
+        """Explicit hello -> hello-ack, with no payload attached.
+
+        Sending does not need this -- the first fragment introduces us by itself.
+        It is here to answer "is anyone out there?" without committing to a
+        transfer, which is exactly what you want when a link is not working.
+        """
+        if not self._running:
+            raise RuntimeError("start RX first -- discovery must hear the reply")
+        peer = self._handshake(self.active_profile if profile_id is None else profile_id,
+                               self.active_band if band_name is None else band_name)
+        if peer:
+            self.peer_id = peer
+        return peer
+
     def _send_payload(self, kind: int, data: bytes, profile_id: int,
                       band_name: str, meta: bytes = b""):
         if profile_id not in PROFILES:
@@ -280,35 +303,38 @@ class Transceiver:
         if self.arq and not self._running:
             self.on_event("warn", "ARQ needs RX on to hear ACKs -- sending blind")
 
-        dst = BROADCAST
-        if arq:
-            dst = self._handshake(profile_id, band_name)
-            if dst == BROADCAST:
-                self.on_event("warn", "no peer answered the handshake -- "
-                                      "sending blind, nothing will be acknowledged")
-                arq = False
-            else:
-                self.peer_id = dst
-
+        # No separate hello: the first fragment goes out addressed to whoever we
+        # last spoke to (or to everyone, if nobody yet), asking to be acked. The
+        # ack that comes back names the peer, so introductions cost no air time
+        # of their own.
+        dst = self.peer_id if arq else BROADCAST
+        flag = ACK_REQ if arq else 0
         ack_wait = (packet_duration_s(ACK_HDR.size, profile_id, band_name)
                     + TURNAROUND_S * 2)
         for idx, frag in enumerate(frags):
-            head = FRAG_HDR.pack(kind, self.device_id, dst, mid, idx, total)
-            packet = encode_packet(head + frag, profile_id, band_name)
             for attempt in range(1, (self.arq_retries if arq else 1) + 1):
+                head = FRAG_HDR.pack(kind | flag, self.device_id, dst,
+                                     mid, idx, total)
+                packet = encode_packet(head + frag, profile_id, band_name)
                 with self._ctrl_lock:
                     self._ctrl_last = None
                     self._ctrl_event.clear()
                 self._play(packet)
                 if not arq:
                     break
+                expect = dst        # BROADCAST -> adopt whoever answers first
                 got = self._await_ctrl(
                     (T_ACK,), time.monotonic() + ack_wait,
-                    # the id check the whole scheme rests on: only the peer we
-                    # shook hands with can advance us to the next fragment
-                    match=lambda g: (g[1] == dst and g[2] == self.device_id
+                    # the id check the whole scheme rests on: once we know the
+                    # peer, only that peer can advance us to the next fragment
+                    match=lambda g: ((expect == BROADCAST or g[1] == expect)
+                                     and g[2] == self.device_id
                                      and g[3] == mid and g[4] == idx))
                 if got:
+                    if dst == BROADCAST:
+                        dst = self.peer_id = got[1]
+                        self.on_event("info", f"peer {dst:04X} identified itself "
+                                              f"in its ack")
                     self.on_event("info", f"frag {idx+1}/{total} acked by {dst:04X}")
                     break
                 self.on_event("warn", f"frag {idx+1}/{total} unacked "
@@ -318,6 +344,9 @@ class Transceiver:
                 self.on_event("error", f"frag {idx+1}/{total} gave up after "
                                        f"{self.arq_retries} attempts; message "
                                        f"{mid:04X} is incomplete")
+                # The peer we were addressing has gone quiet. Forget it, so the
+                # next message rediscovers instead of talking to a ghost.
+                self.peer_id = BROADCAST
                 self.on_progress(0, "TX failed")
                 return
             self.on_progress(int((idx + 1) / total * 100), f"TX {idx+1}/{total}")
@@ -677,15 +706,17 @@ class Transceiver:
         if len(payload) < FRAG_HDR.size:
             return
         kind, src, dst, mid, idx, total = FRAG_HDR.unpack(payload[:FRAG_HDR.size])
+        want_ack = bool(kind & ACK_REQ)
+        kind &= TYPE_MASK
         if total == 0 or idx >= total:
             return
         if dst not in (self.device_id, BROADCAST):
             self.on_event("info", f"frag for {dst:04X}, not us -- ignored")
             return
-        if dst == self.device_id:
-            # Addressed to us, so the sender is waiting on an ACK before it will
-            # move on. Acknowledge before reassembling: the peer's clock is
-            # already running.
+        if want_ack:
+            # The sender is blocked until it hears from us. Acknowledge before
+            # reassembling -- its clock is already running. A broadcast frame is
+            # acked too: that is how a sender that has never met us learns our id.
             self.peer_id = src
             try:
                 self._send_ctrl(T_ACK, src, profile_id, band_name, mid, idx)

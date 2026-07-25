@@ -357,9 +357,11 @@ def _virtual_room(speed, noise, names=("A", "B")):
     the protocol.
     """
     ears = {n: _Ear(noise) for n in names}
+    sent = {n: 0 for n in names}          # packets each device put on the air
 
     def play(audio, sr, device=None, blocking=True):
         audio = np.asarray(audio, np.float32)
+        sent[device] = sent.get(device, 0) + 1
         for name, ear in ears.items():
             if name != device:
                 ear.push(audio)
@@ -387,7 +389,8 @@ def _virtual_room(speed, noise, names=("A", "B")):
                 time.sleep(self.bs / SAMPLE_RATE / speed)
 
     return types.SimpleNamespace(play=play, InputStream=lambda **kw: InStream(**kw),
-                                 check_input_settings=lambda **kw: None)
+                                 check_input_settings=lambda **kw: None,
+                                 sent=sent)
 
 
 def test_handshake_arq():
@@ -430,6 +433,11 @@ def test_handshake_arq():
               "sender saw the fragment acknowledged")
         check(not any(lvl == "error" for lvl, _ in events),
               "no errors raised during the exchange")
+        # The whole point of folding the introduction into the first fragment:
+        # a short word costs one packet each way, not a hello round trip first.
+        check(T.sd.sent["A"] == 1 and T.sd.sent["B"] == 1,
+              f"a short message costs exactly 2 packets on air "
+              f"(sender {T.sd.sent['A']}, receiver {T.sd.sent['B']})")
 
         # -- 2. a swallowed ACK must cause a resend, not a lost fragment -------
         a, b, got, events = pair()

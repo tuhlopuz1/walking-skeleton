@@ -49,8 +49,8 @@ mic  -34.1dB [########--------]  band  -48.0dB  preamble now=0.31 best=0.55 nois
 
 `/mode audible|inaudible` · `/freq <kHz>` · `/profile 0..2` · `/rx on|off` ·
 `/file <path>` · `/devices` · `/in <n>` · `/out <n>` · `/id [hhhh]` ·
-`/arq on|off` · `/probe` · `/selftest` · `/loopback` · `/thresh <x>` · `/clear` ·
-`/quit`. Anything else typed is sent as a text message.
+`/arq on|off` · `/ping` · `/probe` · `/selftest` · `/loopback` · `/thresh <x>` ·
+`/clear` · `/quit`. Anything else typed is sent as a text message.
 
 ## Handshake and ARQ
 
@@ -61,12 +61,24 @@ shows it, `/id A1B2` sets it.
 A transfer is a conversation, not a broadcast:
 
 ```
-A -> *   HELLO        "I am A1A1, who is listening?"
-B -> A   HELLO_ACK    "B2B2 is"                         <- A remembers B2B2
-A -> B   frag 1/3     addressed to B2B2
-B -> A   ACK 1        from B2B2
-A -> B   frag 2/3     ... only after that ACK matched
+A -> *   frag 1/3  from A1A1, ack requested   <- doubles as "who is out there?"
+B -> A   ACK 1     from B2B2                  <- A now knows the peer
+A -> B   frag 2/3  addressed to B2B2          <- only after that ACK matched
+B -> A   ACK 2     from B2B2
 ```
+
+There is deliberately **no hello round trip before a message**. The first
+fragment already carries our id, and the ack already carries the peer's, so a
+separate introduction would double the air time of a short message to learn
+nothing new. A three-letter word costs one packet each way — on FAST that is
+~7.9 s instead of ~14.9 s. `/ping` still does an explicit hello when you want to
+ask "is anyone there?" without committing to a transfer; that is a debugging
+tool, not part of sending.
+
+The high bit of the type byte is the "acknowledge this" flag, so a receiver
+knows whether the sender is blocked waiting. Once a peer is known it is
+remembered and addressed directly; if it stops answering for a whole fragment's
+worth of retries it is forgotten, and the next message rediscovers.
 
 Every frame names its sender **and** its recipient, so the ACK check is exact:
 the sender advances only on an ACK that carries the peer id it shook hands with
@@ -83,8 +95,13 @@ Two consequences worth knowing:
   re-acknowledges a fragment it already has (otherwise the sender never
   advances) but does not deliver it twice.
 
-Cost: one extra packet per fragment plus the handshake. On FAST that is roughly
-+1.3 s per fragment. `/arq off` returns to the old fire-and-forget behaviour.
+Cost: one extra packet per fragment — the ack itself — and the turnaround guards
+around it. `/arq off` returns to fire-and-forget, which is faster and tells you
+nothing about whether anything arrived.
+
+A message under 48 bytes is a single fragment; above that it splits at 48-byte
+boundaries, so the round trips scale with length and short messages pay for
+exactly one.
 
 The turnaround guard matters more than it looks. A sender keeps its own receiver
 muted for a moment after it stops playing, so the room's echo of its own packet
