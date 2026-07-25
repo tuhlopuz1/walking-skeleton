@@ -48,9 +48,50 @@ mic  -34.1dB [########--------]  band  -48.0dB  preamble now=0.31 best=0.55 nois
 ## Commands
 
 `/mode audible|inaudible` · `/freq <kHz>` · `/profile 0..2` · `/rx on|off` ·
-`/file <path>` · `/devices` · `/in <n>` · `/out <n>` · `/probe` · `/selftest` ·
-`/loopback` · `/thresh <x>` · `/clear` · `/quit`. Anything else typed is sent as
-a text message.
+`/file <path>` · `/devices` · `/in <n>` · `/out <n>` · `/id [hhhh]` ·
+`/arq on|off` · `/probe` · `/selftest` · `/loopback` · `/thresh <x>` · `/clear` ·
+`/quit`. Anything else typed is sent as a text message.
+
+## Handshake and ARQ
+
+Every device has a 16-bit id, random on first run and kept in `.device_id` next
+to the module (gitignored — an id that two machines share is not an id). `/id`
+shows it, `/id A1B2` sets it.
+
+A transfer is a conversation, not a broadcast:
+
+```
+A -> *   HELLO        "I am A1A1, who is listening?"
+B -> A   HELLO_ACK    "B2B2 is"                         <- A remembers B2B2
+A -> B   frag 1/3     addressed to B2B2
+B -> A   ACK 1        from B2B2
+A -> B   frag 2/3     ... only after that ACK matched
+```
+
+Every frame names its sender **and** its recipient, so the ACK check is exact:
+the sender advances only on an ACK that carries the peer id it shook hands with
+*and* the fragment index it just sent. Anything else — a stray ACK, a third
+device answering — is ignored and the fragment is resent, up to `arq_retries`
+(4) times. A frame addressed to someone else is dropped without a reply, so two
+pairs can share a room without acking each other's traffic.
+
+Two consequences worth knowing:
+
+- **ARQ needs `/rx on` at both ends.** The sender has to hear the ACK. Without a
+  running receiver it warns and falls back to sending blind.
+- **A lost ACK causes a resend, and the resend is deduplicated.** The receiver
+  re-acknowledges a fragment it already has (otherwise the sender never
+  advances) but does not deliver it twice.
+
+Cost: one extra packet per fragment plus the handshake. On FAST that is roughly
++1.3 s per fragment. `/arq off` returns to the old fire-and-forget behaviour.
+
+The turnaround guard matters more than it looks. A sender keeps its own receiver
+muted for a moment after it stops playing, so the room's echo of its own packet
+is not decoded as an incoming one. A peer that replies *inside* that window
+loses the first thing it says — the chirp preamble — and the exchange stalls
+with neither side at fault. `REPLY_GUARD_S` is that delay before answering, and
+it must exceed the sender's echo tail.
 
 ## Frequency: `/mode` and `/freq`
 
@@ -217,10 +258,11 @@ cross-compile PortAudio-backed exes.)
 
 ## Roadmap (architecture already supports these)
 
-- **ARQ / resume**: fragments carry `msg_id/frag_idx/frag_total`; persist the
-  received `frag_idx` set per `msg_id` and request the missing indices. This is
-  the single biggest reliability win left — today one corrupted fragment loses
-  the whole message.
+- **Resume**: stop-and-wait ARQ is in (see above), so a fragment now survives a
+  loss. What is still missing is *persistence* — the received `frag_idx` set per
+  `msg_id` is in memory only, so a restart mid-transfer starts the message over.
+- **Selective repeat**: stop-and-wait pays a full round trip per fragment. A
+  window plus a bitmap of missing indices would cut that sharply on long files.
 - **Full duplex**: run TX and RX in non-overlapping sub-bands simultaneously.
   `Band`/`Profile` already parametrize the spectrum; define two bands and run
   two streams.
@@ -233,6 +275,9 @@ cross-compile PortAudio-backed exes.)
 ## Known limits
 
 - Half-duplex only (TX mutes RX so the sender does not decode itself).
-- No retransmission: every fragment of a message must arrive intact.
+- Stop-and-wait ARQ: one fragment in flight at a time, so throughput costs a
+  full round trip per fragment. With `/arq off`, or with no peer answering the
+  handshake, there is no retransmission at all and every fragment must land.
+- Reassembly state is in memory: a restart mid-transfer loses the partial message.
 - Hamming(7,4) with depth-12 interleaving fixes scattered single-bit errors and
   short bursts; sustained interference needs RS.

@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+
+# Per-machine identity: each device must keep its own, so it is never shared.
+.device_id
+
+# Files arriving over the air land here.
+received/

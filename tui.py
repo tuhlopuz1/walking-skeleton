@@ -19,6 +19,8 @@ Commands (type in the input box):
     /selftest         encode->decode in memory (no sound card)
     /loopback         full speaker->mic round trip on this machine
     /thresh <x>       preamble detection threshold (default 0.20)
+    /id [hhhh]        show or set this device's 16-bit id
+    /arq on|off       per-fragment ACKs with resend (default on)
     /clear  /quit
     <anything else>   sent as a text message
 """
@@ -108,8 +110,11 @@ def header_text():
     audio = "OK" if HAVE_AUDIO else f"NO AUDIO ({AUDIO_ERROR[:30]})"
     rx = "ON " if trx.rx_running else "OFF"
     mode = "audible" if b.audible else "inaudible"
+    peer = f"{trx.peer_id:04X}" if trx.peer_id else "-"
     return [("class:title",
-             f" ACOUSTIC MODEM | RX:{rx} | {mode} @ {b.base_freq/1000:.2f}kHz "
+             f" ACOUSTIC MODEM {trx.device_id:04X}>{peer} "
+             f"| RX:{rx} | ARQ:{'on ' if trx.arq else 'off'} "
+             f"| {mode} @ {b.base_freq/1000:.2f}kHz "
              f"| profile {pid}:{p.name} ({p.n_tones}-FSK, {p.bitrate:.0f}b/s) "
              f"| audio:{audio} | {STATUS['note']} ")]
 
@@ -166,6 +171,8 @@ def handle_command(text: str):
         log("/freq <kHz>               tune the link, e.g. /freq 18.6   (/freq = show)")
         log("/profile 0|1|2            0 FAST  1 NORMAL  2 ROBUST -- works in any band")
         log("/rx on|off  /file <path>  /devices  /in <n>  /out <n>")
+        log("/id [hhhh]                this device's id (/id = show, /id A1B2 = set)")
+        log("/arq on|off               per-fragment ACKs + resend (needs /rx on)")
         log("/probe  /selftest  /loopback  /thresh <x>  /clear  /quit")
     elif head == "/quit":
         trx.stop_rx()
@@ -265,6 +272,27 @@ def handle_command(text: str):
             f"Receiver auto-adapts, but matching it is faster.")
         for line in trx.plan():
             log("   " + line)
+    elif head == "/id":
+        if len(cmd) < 2:
+            log(f"this device is {trx.device_id:04X}; peer is "
+                + (f"{trx.peer_id:04X}" if trx.peer_id else "unknown "
+                   "(no handshake yet)"))
+            log(f"   stored in {trxmod.DEVICE_ID_FILE}")
+            return
+        try:
+            trx.set_device_id(int(cmd[1], 16))
+        except ValueError as exc:
+            log(f"usage: /id A1B2  (4 hex digits, not 0000) -- {exc}")
+            return
+        log(f"device id -> {trx.device_id:04X}")
+    elif head == "/arq":
+        if len(cmd) > 1 and cmd[1].lower() == "off":
+            trx.arq = False
+            log("ARQ off -- fragments are sent blind, nothing is acknowledged")
+        else:
+            trx.arq = True
+            log(f"ARQ on -- handshake, then {trx.arq_retries} attempts per "
+                f"fragment. Needs '/rx on' here AND on the peer.")
     elif head == "/thresh":
         try:
             trx.detect_threshold = float(cmd[1])
@@ -335,9 +363,12 @@ def build_app():
 
 def main():
     global app
-    log("Acoustic modem TUI.  /help for commands.")
+    log(f"Acoustic modem TUI -- this device is {trx.device_id:04X}.  "
+        f"/help for commands.")
     log("First run on a new machine:  /probe   (checks the speaker+mic can carry the band)")
     log("Then on BOTH devices:  /rx on   and use the SAME /profile.")
+    log("ARQ is on: the first message does a handshake, then every fragment is "
+        "acked. Both ends need '/rx on' for that.")
     if not HAVE_AUDIO:
         log(f"!! sounddevice unavailable: {AUDIO_ERROR}")
     app = build_app()

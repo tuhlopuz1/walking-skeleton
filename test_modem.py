@@ -218,7 +218,7 @@ def test_rx_state_machine():
     """Drive the real Transceiver._rx_loop from a fake sound card."""
     section("streaming receiver (fake sound card)")
     import trx as T
-    from trx import FRAG_HDR, T_TEXT, FRAG_PAYLOAD
+    from trx import FRAG_HDR, T_TEXT, FRAG_PAYLOAD, BROADCAST
 
     state = {"stream": None, "speed": 30.0}
 
@@ -270,7 +270,10 @@ def test_rx_state_machine():
                   f"bad={t.stats['rx_bad']})")
 
         def frame(text, pid, idx=0, total=1, mid=1, gain=0.5, band="ULTRA"):
-            return encode_packet(FRAG_HDR.pack(T_TEXT, mid, idx, total)
+            # Broadcast dst: this suite exercises the receiver, not the ARQ
+            # conversation, and a broadcast frame is deliberately not acked.
+            return encode_packet(FRAG_HDR.pack(T_TEXT, BROADCAST, BROADCAST,
+                                               mid, idx, total)
                                  + text.encode(), pid, band) * gain
 
         for pid, p in PROFILES.items():
@@ -321,6 +324,144 @@ def test_rx_state_machine():
         T.sd, T.HAVE_AUDIO = real_sd, real_have
 
 
+class _Ear:
+    """One device's microphone: a buffer that drains at the playback rate."""
+
+    def __init__(self, noise):
+        self.buf = np.zeros(0, np.float32)
+        self.lock = threading.Lock()
+        self.noise = noise
+
+    def push(self, audio):
+        with self.lock:
+            self.buf = np.concatenate([self.buf, audio])
+
+    def take(self, n, rng):
+        with self.lock:
+            if len(self.buf) >= n:
+                out, self.buf = self.buf[:n], self.buf[n:]
+            elif len(self.buf):
+                out = np.concatenate([self.buf,
+                                      np.zeros(n - len(self.buf), np.float32)])
+                self.buf = np.zeros(0, np.float32)
+            else:
+                out = np.zeros(n, np.float32)
+        return out + rng.standard_normal(n).astype(np.float32) * self.noise
+
+
+def _virtual_room(speed, noise, names=("A", "B")):
+    """A fake `sd` where every device hears every OTHER device, in scaled time.
+
+    Devices do not hear themselves: self-rejection is a physical-layer concern
+    that `lead_in_ok` already covers, and leaving it out keeps this test about
+    the protocol.
+    """
+    ears = {n: _Ear(noise) for n in names}
+
+    def play(audio, sr, device=None, blocking=True):
+        audio = np.asarray(audio, np.float32)
+        for name, ear in ears.items():
+            if name != device:
+                ear.push(audio)
+        time.sleep(len(audio) / SAMPLE_RATE / speed)
+
+    class InStream:
+        def __init__(self, **kw):
+            self.cb, self.bs = kw["callback"], kw["blocksize"]
+            self.ear = ears[kw["device"]]
+            self._stop = False
+
+        def __enter__(self):
+            self.t = threading.Thread(target=self._run, daemon=True)
+            self.t.start()
+            return self
+
+        def __exit__(self, *a):
+            self._stop = True
+
+        def _run(self):
+            rng = np.random.default_rng(7)
+            while not self._stop:
+                self.cb(self.ear.take(self.bs, rng).reshape(-1, 1), self.bs,
+                        None, None)
+                time.sleep(self.bs / SAMPLE_RATE / speed)
+
+    return types.SimpleNamespace(play=play, InputStream=lambda **kw: InStream(**kw),
+                                 check_input_settings=lambda **kw: None)
+
+
+def test_handshake_arq():
+    section("handshake + stop-and-wait ARQ (two virtual devices)")
+    import trx as T
+
+    real_sd, real_have = T.sd, T.HAVE_AUDIO
+    T.HAVE_AUDIO = True
+    try:
+        def pair(speed=14.0, noise=0.004):
+            T.sd = _virtual_room(speed, noise)
+            got, events = [], []
+            a = T.Transceiver(device_in="A", device_out="A",
+                              on_event=lambda l, t: events.append((l, t)))
+            b = T.Transceiver(device_in="B", device_out="B",
+                              on_message=lambda k, d, m: got.append(d),
+                              on_event=lambda l, t: events.append((l, t)))
+            a.device_id, b.device_id = 0xA1A1, 0xB2B2   # distinct, not persisted
+            a.active_profile = b.active_profile = 0     # FAST: shortest packets
+            return a, b, got, events
+
+        # -- 1. full exchange: hello -> hello-ack -> data -> ack ---------------
+        a, b, got, events = pair()
+        a.start_rx()
+        b.start_rx()
+        time.sleep(0.3)
+        tx = threading.Thread(target=a.send_text, args=("ping",), daemon=True)
+        tx.start()
+        tx.join(timeout=90)
+        time.sleep(0.5)
+        a.stop_rx()
+        b.stop_rx()
+
+        check(got == ["ping"], f"message delivered end-to-end (got {got!r})")
+        check(a.peer_id == 0xB2B2, f"sender learned the peer id "
+                                   f"(peer_id={a.peer_id:04X})")
+        check(b.peer_id == 0xA1A1, f"receiver learned the sender id "
+                                   f"(peer_id={b.peer_id:04X})")
+        check(any("acked by B2B2" in t for _, t in events),
+              "sender saw the fragment acknowledged")
+        check(not any(lvl == "error" for lvl, _ in events),
+              "no errors raised during the exchange")
+
+        # -- 2. a swallowed ACK must cause a resend, not a lost fragment -------
+        a, b, got, events = pair()
+        real_ctrl = b._send_ctrl
+        dropped = []
+
+        def flaky(kind, dst, pid, band, mid=0, idx=0):
+            if kind == T.T_ACK and not dropped:
+                dropped.append((mid, idx))     # eat exactly the first ACK
+                return
+            return real_ctrl(kind, dst, pid, band, mid, idx)
+
+        b._send_ctrl = flaky
+        a.start_rx()
+        b.start_rx()
+        time.sleep(0.3)
+        tx = threading.Thread(target=a.send_text, args=("retry",), daemon=True)
+        tx.start()
+        tx.join(timeout=120)
+        time.sleep(0.5)
+        a.stop_rx()
+        b.stop_rx()
+
+        check(bool(dropped), "the test actually swallowed an ACK")
+        check(any("unacked" in t for _, t in events),
+              "sender noticed the missing ACK")
+        check(got == ["retry"],
+              f"fragment was resent and delivered exactly once (got {got!r})")
+    finally:
+        T.sd, T.HAVE_AUDIO = real_sd, real_have
+
+
 def test_rx_thread_reports_errors():
     section("RX thread failures are reported, not swallowed")
     import trx as T
@@ -351,6 +492,7 @@ if __name__ == "__main__":
     test_tuning()
     test_symbol_errors()
     test_rx_state_machine()
+    test_handshake_arq()
     test_rx_thread_reports_errors()
     print("\n" + "=" * 60)
     if FAILURES:

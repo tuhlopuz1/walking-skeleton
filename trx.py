@@ -58,16 +58,65 @@ except Exception as exc:                      # pragma: no cover - env dependent
     AUDIO_ERROR = str(exc)
 
 
-# ---- application-layer fragment header ------------------------------------ #
-# type(1) msg_id(2) frag_idx(2) frag_total(2) [payload]
-FRAG_HDR = struct.Struct(">BHHH")
+# ---- application-layer framing --------------------------------------------- #
+# Every frame names its sender and its intended recipient, so a receiver can tell
+# "this is for me, and I know who it is from" with no out-of-band state. That is
+# what makes stop-and-wait ARQ workable on a shared acoustic channel: an ACK is
+# trusted only when it carries the peer id we shook hands with.
+#
+#   data : type(1) src(2) dst(2) msg_id(2) frag_idx(2) frag_total(2) [payload]
+#   hello: type(1) src(2) dst(2)
+#   ack  : type(1) src(2) dst(2) msg_id(2) frag_idx(2)
+FRAG_HDR = struct.Struct(">BHHHHH")     # 11 B
+HELLO_HDR = struct.Struct(">BHH")       # 5 B
+ACK_HDR = struct.Struct(">BHHHH")       # 9 B
+
 T_TEXT = 0x01
 T_FILE = 0x02
+T_HELLO = 0x10             # "I am about to transmit -- who is listening?"
+T_HELLO_ACK = 0x11         # "I am, and this is my id"
+T_ACK = 0x12               # "I got fragment N of message M"
+
+BROADCAST = 0x0000         # dst everyone accepts and nobody acknowledges
 FRAG_PAYLOAD = 48          # bytes per fragment; small keeps frames short & retryable
 REASM_TIMEOUT = 300.0      # seconds before an incomplete message is dropped
 
+ARQ_RETRIES = 4            # attempts per fragment before the transfer is abandoned
+HANDSHAKE_RETRIES = 3      # attempts to find a peer before the transfer starts
+TURNAROUND_S = 1.5         # slack for the peer to re-arm and begin replying
+REPLY_GUARD_S = 0.4        # wait before answering, so the sender has re-armed
+#   The sender keeps its receiver muted for a moment after it stops playing, to
+#   let the room's echo of its own packet decay. Replying inside that window
+#   means the first syllable of the reply -- the chirp preamble -- is thrown away
+#   with the echo, and the exchange stalls. This guard must exceed that tail.
+
 RX_BLOCK = 1024            # ~21 ms input blocks
 MIN_SEARCH_NEW = 4096      # only run the matched filter once this much is new
+
+DEVICE_ID_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              ".device_id")
+
+
+def load_device_id() -> int:
+    """A stable 16-bit name for this machine, persisted next to the module.
+
+    Stability matters: the peer remembers who it shook hands with, so an id that
+    changed on every run would strand an interrupted transfer.
+    """
+    try:
+        with open(DEVICE_ID_FILE) as f:
+            v = int(f.read().strip(), 16) & 0xFFFF
+        if v != BROADCAST:
+            return v
+    except Exception:
+        pass
+    v = int.from_bytes(os.urandom(2), "big") % 0xFFFF + 1        # never 0
+    try:
+        with open(DEVICE_ID_FILE, "w") as f:
+            f.write(f"{v:04X}")
+    except Exception:
+        pass
+    return v
 
 
 def list_devices() -> list[str]:
@@ -94,21 +143,119 @@ class Transceiver:
         self.active_band = DEFAULT_BAND      # which band we TRANSMIT in
         self.detect_threshold = DETECT_THRESHOLD
 
+        self.device_id = load_device_id()
+        self.peer_id = BROADCAST         # learned by the handshake, 0 = unknown
+        self.arq = True                  # stop-and-wait with per-fragment ACKs
+        self.arq_retries = ARQ_RETRIES
+
         self._rx_thread: threading.Thread | None = None
         self._running = False
         self._tx_active = threading.Event()
         self._msg_id = 0
-        self._reasm: dict[int, dict] = {}
+        self._reasm: dict[tuple, dict] = {}
+        self._done: dict[tuple, float] = {}   # (src, msg_id) already delivered
         self._lock = threading.Lock()
+        self._tx_lock = threading.RLock()   # one speaker: serialise every _play
+        self._rearm = threading.Event()     # RX must drop audio it made itself
+        self._ctrl_lock = threading.Lock()
+        self._ctrl_event = threading.Event()
+        self._ctrl_last: tuple | None = None   # (type, src, dst, msg_id, frag_idx)
         self.stats = {"rms_db": -99.0, "band_db": -99.0, "peak_score": 0.0,
                       "peak_hold": 0.0, "noise_score": 0.0, "state": "off",
                       "rx_ok": 0, "rx_bad": 0, "detections": 0, "rejected": 0}
 
     # ------------------------------------------------------------------ TX -- #
     def _play(self, audio: np.ndarray):
+        """Transmit one packet, with our own receiver muted for the duration.
+
+        The mute is per-packet rather than per-message: ARQ needs the receiver
+        live in the gaps between fragments, which is exactly where the ACK
+        arrives. `_rearm` tells the RX loop to throw away the audio that was
+        queued while we were the one making noise.
+        """
         if not HAVE_AUDIO:
             raise RuntimeError(f"sounddevice not available: {AUDIO_ERROR}")
-        sd.play(audio, SAMPLE_RATE, device=self.device_out, blocking=True)
+        with self._tx_lock:
+            self._tx_active.set()
+            try:
+                sd.play(audio, SAMPLE_RATE, device=self.device_out, blocking=True)
+            finally:
+                time.sleep(0.2)           # let the room's echo of our own TX decay
+                self._rearm.set()
+                self._tx_active.clear()
+
+    # -- control frames -- #
+    def _send_hello(self, profile_id: int, band_name: str):
+        self._play(encode_packet(HELLO_HDR.pack(T_HELLO, self.device_id, BROADCAST),
+                                 profile_id, band_name))
+
+    def _send_ctrl(self, kind: int, dst: int, profile_id: int, band_name: str,
+                   mid: int = 0, idx: int = 0):
+        if kind == T_HELLO_ACK:
+            body = HELLO_HDR.pack(kind, self.device_id, dst)
+        else:
+            body = ACK_HDR.pack(kind, self.device_id, dst, mid, idx)
+        time.sleep(REPLY_GUARD_S)     # let the sender finish re-arming; see above
+        self._play(encode_packet(body, profile_id, band_name))
+
+    def _await_ctrl(self, kinds: tuple, deadline: float, match=None):
+        """Block until a control frame addressed to us matches, or time runs out.
+
+        Returns the matching tuple, or None. Frames that do not match (a stray
+        ACK, or a reply from a device that is not our peer) are discarded and
+        the wait continues -- that is the id check the protocol turns on.
+        """
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            self._ctrl_event.wait(remaining)
+            with self._ctrl_lock:
+                got = self._ctrl_last
+                self._ctrl_last = None
+                self._ctrl_event.clear()
+            if got is None:
+                continue
+            if got[0] in kinds and (match is None or match(got)):
+                return got
+            self.on_event("warn", f"ignored control frame {got[0]:#04x} "
+                                  f"from {got[1]:04X} (not what we waited for)")
+
+    def _post_ctrl(self, info: tuple):
+        """Hand a control frame to whoever is waiting in `_await_ctrl`."""
+        with self._ctrl_lock:
+            self._ctrl_last = info
+            self._ctrl_event.set()
+
+    def set_device_id(self, value: int) -> int:
+        value &= 0xFFFF
+        if value == BROADCAST:
+            raise ValueError("0000 is the broadcast address, not a device id")
+        self.device_id = value
+        try:
+            with open(DEVICE_ID_FILE, "w") as f:
+                f.write(f"{value:04X}")
+        except Exception as exc:
+            self.on_event("warn", f"device id not persisted: {exc}")
+        return value
+
+    def _handshake(self, profile_id: int, band_name: str) -> int:
+        """Announce ourselves and learn who is listening. Returns a peer id or 0."""
+        wait = (packet_duration_s(HELLO_HDR.size, profile_id, band_name)
+                + TURNAROUND_S * 2)
+        for attempt in range(1, HANDSHAKE_RETRIES + 1):
+            self.on_event("info", f"handshake {attempt}/{HANDSHAKE_RETRIES}: "
+                                  f"hello from {self.device_id:04X}")
+            with self._ctrl_lock:
+                self._ctrl_last = None
+                self._ctrl_event.clear()
+            self._send_hello(profile_id, band_name)
+            got = self._await_ctrl((T_HELLO_ACK,), time.monotonic() + wait,
+                                   match=lambda g: g[2] == self.device_id)
+            if got:
+                self.on_event("info", f"peer {got[1]:04X} answered")
+                return got[1]
+        return BROADCAST
 
     def _send_payload(self, kind: int, data: bytes, profile_id: int,
                       band_name: str, meta: bytes = b""):
@@ -128,17 +275,53 @@ class Transceiver:
         self.on_event("info", f"TX {total} frag(s) {PROFILES[profile_id].name} @ "
                               f"{band.base_freq/1000:.2f} kHz ({band_name}), "
                               f"~{est:.1f}s of audio")
-        # Half-duplex: silence our own receiver so it does not decode the speaker.
-        self._tx_active.set()
-        try:
-            for idx, frag in enumerate(frags):
-                head = FRAG_HDR.pack(kind, mid, idx, total)
-                self._play(encode_packet(head + frag, profile_id, band_name))
-                self.on_progress(int((idx + 1) / total * 100), f"TX {idx+1}/{total}")
-                time.sleep(0.15)          # inter-frame gap; lets RX re-arm
-        finally:
-            time.sleep(0.2)               # let the room's echo of our own TX decay
-            self._tx_active.clear()
+
+        arq = self.arq and self._running     # ACKs need our own receiver running
+        if self.arq and not self._running:
+            self.on_event("warn", "ARQ needs RX on to hear ACKs -- sending blind")
+
+        dst = BROADCAST
+        if arq:
+            dst = self._handshake(profile_id, band_name)
+            if dst == BROADCAST:
+                self.on_event("warn", "no peer answered the handshake -- "
+                                      "sending blind, nothing will be acknowledged")
+                arq = False
+            else:
+                self.peer_id = dst
+
+        ack_wait = (packet_duration_s(ACK_HDR.size, profile_id, band_name)
+                    + TURNAROUND_S * 2)
+        for idx, frag in enumerate(frags):
+            head = FRAG_HDR.pack(kind, self.device_id, dst, mid, idx, total)
+            packet = encode_packet(head + frag, profile_id, band_name)
+            for attempt in range(1, (self.arq_retries if arq else 1) + 1):
+                with self._ctrl_lock:
+                    self._ctrl_last = None
+                    self._ctrl_event.clear()
+                self._play(packet)
+                if not arq:
+                    break
+                got = self._await_ctrl(
+                    (T_ACK,), time.monotonic() + ack_wait,
+                    # the id check the whole scheme rests on: only the peer we
+                    # shook hands with can advance us to the next fragment
+                    match=lambda g: (g[1] == dst and g[2] == self.device_id
+                                     and g[3] == mid and g[4] == idx))
+                if got:
+                    self.on_event("info", f"frag {idx+1}/{total} acked by {dst:04X}")
+                    break
+                self.on_event("warn", f"frag {idx+1}/{total} unacked "
+                                      f"(attempt {attempt}/{self.arq_retries}) "
+                                      f"-- resending")
+            else:
+                self.on_event("error", f"frag {idx+1}/{total} gave up after "
+                                       f"{self.arq_retries} attempts; message "
+                                       f"{mid:04X} is incomplete")
+                self.on_progress(0, "TX failed")
+                return
+            self.on_progress(int((idx + 1) / total * 100), f"TX {idx+1}/{total}")
+            time.sleep(0.15)              # inter-frame gap; lets the peer re-arm
 
     def send_text(self, text: str, profile_id: int | None = None,
                   band_name: str | None = None):
@@ -286,11 +469,16 @@ class Transceiver:
                     self.on_event("info", "retuned -- matched filters rebuilt")
                     continue
 
-                if self._tx_active.is_set():
-                    # Transmitting: drop everything and re-arm past our own audio.
+                if self._tx_active.is_set() or self._rearm.is_set():
+                    # Either we are transmitting right now, or we just finished
+                    # and the queue still holds our own packet. Both cases: drop
+                    # everything and re-arm past it. Absolute indices are our own
+                    # bookkeeping, so skipping samples outright is consistent.
+                    self._rearm.clear()
                     origin = search = origin + len(buf) + len(chunk)
                     buf = np.zeros(0, dtype=np.float32)
-                    state, self.stats["state"] = "SEARCH", "tx"
+                    state = "SEARCH"
+                    self.stats["state"] = "tx" if self._tx_active.is_set() else "search"
                     continue
 
                 buf = np.concatenate([buf, chunk])
@@ -418,7 +606,9 @@ class Transceiver:
                         self.on_event("info", f"frame ok ({lock_len}B)"
                                               + (f" after {tries} sync tries"
                                                  if tries > 1 else ""))
-                        self._on_frame(res.payload)
+                        # Replies go out on the profile/band the frame arrived
+                        # on, not on ours -- the sender is listening there.
+                        self._on_frame(res.payload, lock_pid, det_band)
                     else:
                         self.stats["rx_bad"] += 1
                         self.on_event("warn", f"frame dropped: {res.reason} "
@@ -445,18 +635,81 @@ class Transceiver:
         self.stats["peak_hold"] = 0.0
 
     # ---------------------------------------------------------- reassembly -- #
-    def _on_frame(self, payload: bytes):
+    def _on_frame(self, payload: bytes, profile_id: int, band_name: str):
+        """Dispatch one decoded frame: control traffic, or a data fragment.
+
+        Control frames are handed to whichever thread is blocked in
+        `_await_ctrl`; data frames are reassembled and acknowledged.
+        """
+        if not payload:
+            return
+        kind = payload[0]
+
+        if kind in (T_HELLO, T_HELLO_ACK):
+            if len(payload) < HELLO_HDR.size:
+                return
+            _, src, dst = HELLO_HDR.unpack(payload[:HELLO_HDR.size])
+            if kind == T_HELLO:
+                # Someone is about to transmit. Answer with our own id so they
+                # know who they are talking to -- that id gates every later ACK.
+                self.on_event("info", f"hello from {src:04X} -- answering as "
+                                      f"{self.device_id:04X}")
+                self.peer_id = src
+                try:
+                    self._send_ctrl(T_HELLO_ACK, src, profile_id, band_name)
+                except Exception as exc:
+                    self.on_event("error", f"hello-ack failed: {exc}")
+                return
+            if dst not in (self.device_id, BROADCAST):
+                return
+            self._post_ctrl((kind, src, dst, 0, 0))
+            return
+
+        if kind == T_ACK:
+            if len(payload) < ACK_HDR.size:
+                return
+            _, src, dst, mid, idx = ACK_HDR.unpack(payload[:ACK_HDR.size])
+            if dst != self.device_id:
+                return
+            self._post_ctrl((kind, src, dst, mid, idx))
+            return
+
         if len(payload) < FRAG_HDR.size:
             return
-        kind, mid, idx, total = FRAG_HDR.unpack(payload[:FRAG_HDR.size])
+        kind, src, dst, mid, idx, total = FRAG_HDR.unpack(payload[:FRAG_HDR.size])
         if total == 0 or idx >= total:
             return
+        if dst not in (self.device_id, BROADCAST):
+            self.on_event("info", f"frag for {dst:04X}, not us -- ignored")
+            return
+        if dst == self.device_id:
+            # Addressed to us, so the sender is waiting on an ACK before it will
+            # move on. Acknowledge before reassembling: the peer's clock is
+            # already running.
+            self.peer_id = src
+            try:
+                self._send_ctrl(T_ACK, src, profile_id, band_name, mid, idx)
+                self.on_event("info", f"acked frag {idx+1}/{total} to {src:04X}")
+            except Exception as exc:
+                self.on_event("error", f"ack failed: {exc}")
         frag = payload[FRAG_HDR.size:]
         now = time.time()
         for k, v in list(self._reasm.items()):        # expire stale partials
             if now - v["t"] > REASM_TIMEOUT:
                 del self._reasm[k]
-        slot = self._reasm.setdefault(mid, {"parts": {}, "total": total,
+        for k, ts in list(self._done.items()):
+            if now - ts > REASM_TIMEOUT:
+                del self._done[k]
+
+        # A lost ACK makes the sender resend a fragment we already have. It must
+        # still be acknowledged (done above, unconditionally) or the sender never
+        # advances -- but it must not be delivered twice.
+        key = (src, mid)
+        if key in self._done:
+            self.on_event("info", f"duplicate frag {idx+1}/{total} of msg "
+                                  f"{mid:04X} -- re-acked, not re-delivered")
+            return
+        slot = self._reasm.setdefault(key, {"parts": {}, "total": total,
                                             "kind": kind, "t": now})
         slot["parts"][idx] = frag
         slot["t"] = now
@@ -464,7 +717,8 @@ class Transceiver:
         self.on_progress(int(got / total * 100), f"RX {got}/{total}")
         if got == total:
             blob = b"".join(slot["parts"][i] for i in range(total))
-            del self._reasm[mid]
+            del self._reasm[key]
+            self._done[key] = now
             self._deliver(kind, blob)
 
     def _deliver(self, kind: int, blob: bytes):
@@ -606,7 +860,8 @@ def loopback(profile_id: int = DEFAULT_PROFILE, text: str = "loopback test",
     if not HAVE_AUDIO:
         return [f"sounddevice not available: {AUDIO_ERROR}"]
     from modem_core import try_decode, data_offset_in_packet
-    payload = FRAG_HDR.pack(T_TEXT, 1, 0, 1) + text.encode()
+    # Broadcast src/dst: loopback is a link test, not a conversation.
+    payload = FRAG_HDR.pack(T_TEXT, BROADCAST, BROADCAST, 1, 0, 1) + text.encode()
     pkt = encode_packet(payload, profile_id, band_name)
     pad = np.zeros(int(SAMPLE_RATE * 0.4), np.float32)
     sig = np.concatenate([pad, pkt, pad])
