@@ -6,20 +6,30 @@
 //! wire without either of them needing a sound card.
 
 use std::io::{Read, Write};
+use std::sync::Arc;
 
+use acoustic_modem::audio::{list_devices, Backend, CpalBackend};
 use acoustic_modem::band::{band_plan, Band, BandSet, DEFAULT_BAND};
 use acoustic_modem::chirp::PreambleDetector;
+use acoustic_modem::diag;
 use acoustic_modem::packet::{data_offset_in_packet, encode_packet, packet_duration_s, try_decode};
 use acoustic_modem::profile::{profile, DEFAULT_PROFILE, PROFILES};
+use acoustic_modem::trx::{Event, Level, Transceiver};
 
 fn usage() -> ! {
     eprintln!(
         "usage:
-  modem plan     [--band NAME] [--freq kHz]
-  modem selftest [--band NAME] [--freq kHz]
-  modem encode <text> <out.f32> [--profile N] [--band NAME] [--freq kHz]
-  modem decode <in.f32>         [--band NAME] [--freq kHz]
+  modem devices
+  modem plan     [opts]
+  modem selftest [opts]                      encode->decode in memory
+  modem probe    [opts]                      what this speaker+mic pair carries
+  modem loopback [opts]                      speaker -> air -> mic round trip
+  modem listen   [opts] [--id HHHH]          receive until Ctrl-C
+  modem send <text> [opts] [--id HHHH] [--no-arq]
+  modem encode <text> <out.f32> [opts]
+  modem decode <in.f32>         [opts]
 
+opts: [--profile N] [--band NAME] [--freq kHz] [--in NAME] [--out NAME]
 f32 files are raw little-endian mono at 48 kHz."
     );
     std::process::exit(2)
@@ -28,41 +38,71 @@ f32 files are raw little-endian mono at 48 kHz."
 struct Opts {
     profile: usize,
     band: Band,
+    band_name: String,
+    freq_hz: Option<f64>,
+    input: Option<String>,
+    output: Option<String>,
+    device_id: u16,
+    arq: bool,
 }
 
 fn parse_opts(args: &[String]) -> Opts {
     let mut set = BandSet::default();
     let mut band_name = DEFAULT_BAND.to_string();
     let mut profile_id = DEFAULT_PROFILE;
+    let mut freq_hz = None;
+    let mut input = None;
+    let mut output = None;
+    // A random-but-stable-per-run id keeps two processes on one machine distinct
+    // without a config file; `--id` pins it when that matters.
+    let mut device_id: u16 = (std::process::id() as u16) | 1;
+    let mut arq = true;
+
     let mut i = 0;
+    let want = |args: &[String], i: usize| -> String {
+        args.get(i + 1).cloned().unwrap_or_else(|| usage())
+    };
     while i < args.len() {
         match args[i].as_str() {
             "--profile" => {
-                profile_id = args
-                    .get(i + 1)
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or_else(|| usage());
+                profile_id = want(args, i).parse().unwrap_or_else(|_| usage());
                 i += 2;
             }
             "--band" => {
-                band_name = args.get(i + 1).cloned().unwrap_or_else(|| usage());
+                band_name = want(args, i);
                 i += 2;
             }
             "--freq" => {
-                let khz: f64 = args
-                    .get(i + 1)
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or_else(|| usage());
-                if let Err(e) = set.set_base_freq(&band_name, khz * 1000.0) {
-                    eprintln!("bad --freq: {e}");
-                    std::process::exit(2);
-                }
+                let khz: f64 = want(args, i).parse().unwrap_or_else(|_| usage());
+                freq_hz = Some(khz * 1000.0);
                 i += 2;
+            }
+            "--in" => {
+                input = Some(want(args, i));
+                i += 2;
+            }
+            "--out" => {
+                output = Some(want(args, i));
+                i += 2;
+            }
+            "--id" => {
+                device_id = u16::from_str_radix(&want(args, i), 16).unwrap_or_else(|_| usage());
+                i += 2;
+            }
+            "--no-arq" => {
+                arq = false;
+                i += 1;
             }
             other => {
                 eprintln!("unknown option {other}");
                 usage()
             }
+        }
+    }
+    if let Some(hz) = freq_hz {
+        if let Err(e) = set.set_base_freq(&band_name, hz) {
+            eprintln!("bad --freq: {e}");
+            std::process::exit(2);
         }
     }
     if profile(profile_id).is_none() {
@@ -73,7 +113,58 @@ fn parse_opts(args: &[String]) -> Opts {
         eprintln!("unknown band {band_name}");
         std::process::exit(2);
     };
-    Opts { profile: profile_id, band }
+    if device_id == 0 {
+        device_id = 1;
+    }
+    Opts { profile: profile_id, band, band_name, freq_hz, input, output, device_id, arq }
+}
+
+/// A live transceiver configured from the command line, with its receiver up.
+fn live(o: &Opts) -> (Transceiver, std::sync::mpsc::Receiver<Event>) {
+    let backend: Arc<dyn Backend> =
+        Arc::new(CpalBackend::new(o.input.clone(), o.output.clone()));
+    let (trx, events) = Transceiver::new(backend, o.device_id);
+    trx.update_config(|c| {
+        c.active_profile = o.profile;
+        c.active_band = o.band_name.clone();
+        c.arq = o.arq;
+    });
+    if let Some(hz) = o.freq_hz {
+        if let Err(e) = trx.set_frequency(&o.band_name, hz) {
+            eprintln!("retune failed: {e}");
+            std::process::exit(1);
+        }
+    }
+    (trx, events)
+}
+
+fn print_event(ev: &Event) {
+    match ev {
+        Event::Log(level, text) => {
+            let tag = match level {
+                Level::Info => "info",
+                Level::Warn => "WARN",
+                Level::Error => "ERR ",
+            };
+            println!("[{tag}] {text}");
+        }
+        Event::Progress { pct, note } => println!("       {note} [{pct}%]"),
+        Event::Text(t) => println!("<< TEXT: {t}"),
+        Event::File { meta, data } => {
+            let dir = std::path::Path::new("received");
+            let _ = std::fs::create_dir_all(dir);
+            let name = std::path::Path::new(&meta.name)
+                .file_name()
+                .map(|s| s.to_owned())
+                .unwrap_or_else(|| "received.bin".into());
+            let path = dir.join(name);
+            match std::fs::write(&path, data) {
+                Ok(()) => println!("<< FILE: {} ({} B) -> {}", meta.name, data.len(), path.display()),
+                Err(e) => println!("<< FILE: {} could not be saved: {e}", meta.name),
+            }
+        }
+        Event::PeerChanged(id) => println!("       peer is now {id:04X}"),
+    }
 }
 
 fn read_f32(path: &str) -> std::io::Result<Vec<f32>> {
@@ -116,6 +207,12 @@ fn main() {
     let Some(cmd) = argv.first().cloned() else { usage() };
 
     match cmd.as_str() {
+        "devices" => {
+            for line in list_devices() {
+                println!("{line}");
+            }
+        }
+
         "plan" => {
             let o = parse_opts(&argv[1..]);
             for line in band_plan(&o.band, None) {
@@ -125,26 +222,95 @@ fn main() {
 
         "selftest" => {
             let o = parse_opts(&argv[1..]);
-            for line in band_plan(&o.band, None) {
+            let lines = diag::selftest(&o.band);
+            let failed = lines.iter().any(|l| l.contains("FAIL"));
+            for line in lines {
                 println!("{line}");
             }
-            let payload: Vec<u8> = b"selftest ".iter().copied().chain(0u8..32).collect();
-            let mut failures = 0;
-            for (pid, p) in PROFILES.iter().enumerate() {
-                let pkt = encode_packet(&payload, pid, &o.band);
-                let mut stream = vec![0.0f32; 3000];
-                stream.extend_from_slice(&pkt);
-                stream.extend(std::iter::repeat(0.0).take(3000));
-                let (score, _, r) = locate_and_decode(&stream, &o.band);
-                let ok = r.ok && r.payload == payload;
-                failures += !ok as i32;
-                println!(
-                    "  {:8} score={score:.2} {}",
-                    p.name,
-                    if ok { "PASS".to_string() } else { format!("FAIL {}", r.reason) }
-                );
+            if failed {
+                std::process::exit(1);
             }
-            if failures > 0 {
+        }
+
+        "probe" => {
+            let o = parse_opts(&argv[1..]);
+            let backend: Arc<dyn Backend> =
+                Arc::new(CpalBackend::new(o.input.clone(), o.output.clone()));
+            match diag::probe(&backend, &o.band) {
+                Ok(lines) => lines.iter().for_each(|l| println!("{l}")),
+                Err(e) => {
+                    eprintln!("probe failed: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+
+        "loopback" => {
+            let o = parse_opts(&argv[1..]);
+            let backend: Arc<dyn Backend> =
+                Arc::new(CpalBackend::new(o.input.clone(), o.output.clone()));
+            match diag::loopback(&backend, o.profile, "loopback test", &o.band) {
+                Ok(lines) => {
+                    let failed = lines.iter().any(|l| l.contains("FAIL"));
+                    lines.iter().for_each(|l| println!("{l}"));
+                    if failed {
+                        std::process::exit(1);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("loopback failed: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+
+        "listen" => {
+            let o = parse_opts(&argv[1..]);
+            let (trx, events) = live(&o);
+            if let Err(e) = trx.start_rx() {
+                eprintln!("cannot start RX: {e}");
+                eprintln!("try `modem devices` then --in <name>; the mic must accept 48 kHz");
+                std::process::exit(1);
+            }
+            println!(
+                "listening as {:04X} on {} @ {:.2} kHz, profile {} — Ctrl-C to stop",
+                trx.device_id(),
+                o.band.name,
+                o.band.base_freq / 1000.0,
+                o.profile
+            );
+            // The receiver runs on its own thread; this one just relays events.
+            for ev in events.iter() {
+                print_event(&ev);
+            }
+        }
+
+        "send" => {
+            if argv.len() < 2 {
+                usage()
+            }
+            let text = argv[1].clone();
+            let o = parse_opts(&argv[2..]);
+            let (trx, events) = live(&o);
+            // ARQ needs our own receiver up to hear the acknowledgement.
+            if o.arq {
+                if let Err(e) = trx.start_rx() {
+                    eprintln!("cannot start RX (needed for ARQ): {e}");
+                    std::process::exit(1);
+                }
+            }
+            let printer = std::thread::spawn(move || {
+                for ev in events.iter() {
+                    print_event(&ev);
+                }
+            });
+            let result = trx.send_text(&text);
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            trx.stop_rx();
+            drop(trx); // closes the event channel, ending the printer
+            let _ = printer.join();
+            if let Err(e) = result {
+                eprintln!("send failed: {e}");
                 std::process::exit(1);
             }
         }

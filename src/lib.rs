@@ -14,12 +14,16 @@
 //! sight, so it is testable without a sound card — the property that made the
 //! Python version debuggable, and worth keeping.
 
+pub mod audio;
 pub mod band;
 pub mod chirp;
+pub mod diag;
 pub mod fec;
+pub mod framing;
 pub mod mfsk;
 pub mod packet;
 pub mod profile;
+pub mod trx;
 
 /// Fixed at 48 kHz: Nyquist at 24 kHz leaves room for the 18–20 kHz band.
 pub const SAMPLE_RATE: u32 = 48_000;

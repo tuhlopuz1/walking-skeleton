@@ -1,21 +1,71 @@
 # Acoustic Near-Ultrasonic Modem (half-duplex transceiver)
 
 Data-over-sound modem: M-FSK + Hamming(7,4) FEC + block interleaving + CRC-16,
-chirp preamble with a matched-filter sync, TUI for half-duplex text & file
-transfer. Sample rate fixed at 48 kHz. Pure-Python, extensible.
+chirp preamble with a matched-filter sync, half-duplex text & file transfer with
+stop-and-wait ARQ. Sample rate fixed at 48 kHz.
+
+There are **two implementations of the same protocol**, and they are wire
+compatible — `tools/cross_check.py` proves it by having each decode the other's
+audio, in every profile and band, including after a retune.
+
+- **Rust** (`src/`) — the one to build on. Library plus a `modem` CLI.
+- **Python** (`*.py`) — the reference. It is where the design was worked out and
+  it stays the executable specification.
 
 ## Files
 
+### Rust
+
+- `src/fec.rs` — CRC-16, Hamming(7,4), block interleaver.
+- `src/profile.rs`, `src/band.rs` — how to modulate, and where in the spectrum.
+  Bands live in a `BandSet` owned by the caller, not a global registry, so two
+  links can run in one process.
+- `src/chirp.rs` — preamble generation and the normalized matched filter.
+- `src/mfsk.rs` — modulator/demodulator.
+- `src/packet.rs` — framing, `encode_packet`, `decode_header`/`decode_frame`.
+- `src/framing.rs` — the application header: ids, fragments, ACK flag.
+- `src/trx.rs` — the transceiver: streaming RX state machine, TX, ARQ.
+- `src/audio.rs` — cpal, behind a `Backend` trait.
+- `src/diag.rs` — `selftest` / `probe` / `loopback`.
+- `tests/` — the offline suite. `cargo test` needs no sound card.
+
+Everything up to `packet` is pure DSP over `&[f32]`, and `trx` talks to a trait
+rather than to cpal. That is what keeps the whole stack testable in CI, and it
+is the property worth preserving when the frontend lands.
+
+### Python
+
 - `modem_core.py` — DSP + framing + FEC + CRC + preamble detector. **Zero audio
-  deps** (numpy only). Unit-testable without a sound card.
-- `trx.py` — half-duplex transceiver (audio I/O, streaming receiver, fragmentation,
-  text/file) plus the `selftest` / `probe` / `loopback` diagnostics.
+  deps** (numpy only).
+- `trx.py` — half-duplex transceiver plus the diagnostics.
 - `tui.py` — terminal UI (Windows Terminal friendly).
-- `test_modem.py` — offline test suite, **no sound card needed**:
-  `python test_modem.py`. Covers FEC/interleaving/CRC, sync, the codec across
-  all profiles, and the streaming receiver driven by a fake sound card.
+- `test_modem.py` — offline test suite: `python test_modem.py`.
 
 ## Run
+
+### Rust
+
+```
+cargo build --release
+
+target/release/modem devices
+target/release/modem probe                     # can this hardware carry the band?
+target/release/modem loopback --profile 2      # speaker -> air -> mic round trip
+target/release/modem listen --id A1A1          # on one machine
+target/release/modem send "hello" --id B2B2    # on the other
+```
+
+`--profile 0|1|2`, `--band ULTRA|AUDIO`, `--freq <kHz>`, `--in`/`--out <device>`
+apply to all of them. `send` starts a receiver of its own, because ARQ has to
+hear the acknowledgement; `--no-arq` sends blind instead.
+
+Wire-compatibility check between the two implementations:
+
+```
+cargo build --release && python tools/cross_check.py
+```
+
+### Python
 
 ```
 python -m pip install -r requirements.txt
@@ -87,7 +137,14 @@ device answering — is ignored and the fragment is resent, up to `arq_retries`
 (4) times. A frame addressed to someone else is dropped without a reply, so two
 pairs can share a room without acking each other's traffic.
 
-Two consequences worth knowing:
+Three consequences worth knowing:
+
+- **The first message of a session is broadcast, so every listener acks it.** That
+  is how discovery works, and in a room with three devices it means two of them
+  answer at once. The sender takes whichever ack lands first and addresses that
+  device from then on, after which the bystanders go quiet — but the opening
+  exchange wants a quiet room. Pinning the pair up front with `discover()` /
+  `/ping` avoids the collision entirely.
 
 - **ARQ needs `/rx on` at both ends.** The sender has to hear the ACK. Without a
   running receiver it warns and falls back to sending blind.

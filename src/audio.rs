@@ -30,6 +30,24 @@ impl Drop for CaptureHandle {
     }
 }
 
+/// Run `body` on a dedicated thread until the handle is dropped.
+///
+/// `body` receives a predicate to poll for "time to stop". Capture backends need
+/// this shape because a cpal stream is not `Send` on every platform: it has to
+/// be created and dropped on one thread that simply waits in between. A test
+/// backend gets the same lifecycle for free.
+pub fn spawn_capture<F>(body: F) -> Result<CaptureHandle, String>
+where
+    F: FnOnce(Box<dyn Fn() -> bool + Send>) + Send + 'static,
+{
+    let stop = Arc::new(AtomicBool::new(false));
+    let flag = stop.clone();
+    let join = std::thread::spawn(move || {
+        body(Box::new(move || flag.load(Ordering::SeqCst)));
+    });
+    Ok(CaptureHandle { stop, join: Some(join) })
+}
+
 pub trait Backend: Send + Sync {
     /// Play `samples` and return once they have been handed to the device.
     fn play(&self, samples: &[f32]) -> Result<(), String>;
