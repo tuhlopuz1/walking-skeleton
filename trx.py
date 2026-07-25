@@ -90,7 +90,13 @@ REASM_TIMEOUT = 300.0      # seconds before an incomplete message is dropped
 
 ARQ_RETRIES = 4            # attempts per fragment before the transfer is abandoned
 HANDSHAKE_RETRIES = 3      # attempts to find a peer before the transfer starts
-TURNAROUND_S = 1.5         # slack for the peer to re-arm and begin replying
+TURNAROUND_S = 2.5         # slack for the peer to re-arm and begin replying
+#   Deliberately generous. `sd.play` opens a fresh output stream per packet, and
+#   that startup was measured at ~0.75 s on hardware whose PortAudio descriptor
+#   claims 0.18 s -- so the reported latency cannot be trusted to size this. The
+#   asymmetry is what settles it: waiting too long costs nothing when the ack
+#   does arrive (the wait ends on the ack, not on the clock), while timing out
+#   early costs a full data packet resend, which is tens of seconds.
 REPLY_GUARD_S = 0.4        # wait before answering, so the sender has re-armed
 #   The sender keeps its receiver muted for a moment after it stops playing, to
 #   let the room's echo of its own packet decay. Replying inside that window
